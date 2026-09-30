@@ -63,6 +63,10 @@ token_dropout = 0.0
 t_min = 0.0  # 365.25/12.
 mask_ties = True
 use_film = False
+film_mode = 'both'
+film_location = 'both'
+film_context = 'hidden'
+film_scale = 0.1
 ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
@@ -130,7 +134,9 @@ print(f"found vocab_size = {vocab_size}")
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=vocab_size, dropout=dropout, token_dropout=token_dropout, t_min=t_min,
-                  mask_ties=mask_ties, use_film=use_film, ignore_tokens=ignore_tokens)  # start with model_args from command line
+                  mask_ties=mask_ties, use_film=use_film, film_mode=film_mode,
+                  film_location=film_location, film_context=film_context,
+                  film_scale=film_scale, ignore_tokens=ignore_tokens)  # start with model_args from command line
 
 if init_from == 'scratch':
     # init a new model from scratch

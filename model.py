@@ -106,11 +106,23 @@ class FiLMLayer(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        # Input: token embedding (for measurement-type context) + raw value + z-score
-        # We project token embedding down to 16 dims to keep FiLM lightweight
-        self.tok_proj = nn.Linear(config.n_embd, 16, bias=False)
+        self.context_mode = getattr(config, 'film_context', 'hidden')
+        self.film_mode = getattr(config, 'film_mode', 'both')
+        self.film_scale = getattr(config, 'film_scale', 0.1)
+        if self.context_mode not in ('hidden', 'numeric'):
+            raise ValueError(f"Unknown film_context: {self.context_mode}")
+        if self.film_mode not in ('both', 'gamma', 'beta'):
+            raise ValueError(f"Unknown film_mode: {self.film_mode}")
+
+        condition_dim = 2
+        if self.context_mode == 'hidden':
+            # Project hidden context down to keep FiLM lightweight.
+            self.tok_proj = nn.Linear(config.n_embd, 16, bias=False)
+            condition_dim += 16
+        else:
+            self.tok_proj = None
         self.film_gen = nn.Sequential(
-            nn.Linear(16 + 2, config.n_embd),  # 16 tok_proj + raw_value + z_score
+            nn.Linear(condition_dim, config.n_embd),
             nn.GELU(),
             nn.Linear(config.n_embd, 2 * config.n_embd),  # γ and β
         )
@@ -127,13 +139,20 @@ class FiLMLayer(nn.Module):
         Returns:
             Modulated x: (B, T, C)
         """
-        tok_ctx = self.tok_proj(x.detach())  # (B, T, 16) — detached to avoid gradient shortcuts
-        cond = torch.cat([tok_ctx, numeric_values], dim=-1)  # (B, T, 18)
-        film_params = self.film_gen(cond)  # (B, T, 2*C)
+        if self.context_mode == 'hidden':
+            tok_ctx = self.tok_proj(x.detach())  # (B, T, 16)
+            cond = torch.cat([tok_ctx, numeric_values], dim=-1)
+        else:
+            cond = numeric_values
+        film_params = self.film_gen(cond)
         gamma, beta = film_params.chunk(2, dim=-1)  # each (B, T, C)
         # Keep repeated modulation across blocks close to the identity.
-        gamma = 0.1 * torch.tanh(gamma)
-        beta = 0.1 * torch.tanh(beta)
+        gamma = self.film_scale * torch.tanh(gamma)
+        beta = self.film_scale * torch.tanh(beta)
+        if self.film_mode == 'gamma':
+            beta = torch.zeros_like(beta)
+        elif self.film_mode == 'beta':
+            gamma = torch.zeros_like(gamma)
 
         # Only apply modulation where numeric values exist; identity otherwise
         mask = has_numeric.unsqueeze(-1).float()  # (B, T, 1)
@@ -151,6 +170,9 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
         self.use_film = getattr(config, 'use_film', False)
+        self.film_location = getattr(config, 'film_location', 'both')
+        if self.film_location not in ('both', 'attn', 'mlp'):
+            raise ValueError(f"Unknown film_location: {self.film_location}")
         if self.use_film:
             self.film_attn = FiLMLayer(config)
             self.film_mlp = FiLMLayer(config)
@@ -158,10 +180,10 @@ class Block(nn.Module):
     def forward(self, x, attn_mask, numeric_values=None, has_numeric=None):
         y, att = self.attn(self.ln_1(x), attn_mask)
         x = x + y
-        if self.use_film and numeric_values is not None:
+        if self.use_film and numeric_values is not None and self.film_location in ('both', 'attn'):
             x = self.film_attn(x, numeric_values, has_numeric)
         x = x + self.mlp(self.ln_2(x))
-        if self.use_film and numeric_values is not None:
+        if self.use_film and numeric_values is not None and self.film_location in ('both', 'mlp'):
             x = self.film_mlp(x, numeric_values, has_numeric)
         return x, att
 
@@ -200,6 +222,10 @@ class DelphiConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     mask_ties: bool = False
     use_film: bool = False  # allow FiLM layers for numeric value encoding
+    film_mode: str = 'both'  # 'both', 'gamma', or 'beta'
+    film_location: str = 'both'  # 'both', 'attn', or 'mlp'
+    film_context: str = 'hidden'  # 'hidden' or 'numeric'
+    film_scale: float = 0.1
     ignore_tokens: list = field(default_factory=lambda: [0])
 
 class Delphi(nn.Module):

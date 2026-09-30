@@ -41,3 +41,7 @@ token_dropout = 0.0
 no_event_token_rate = 5
 
 use_film = True
+film_mode = 'both'
+film_location = 'both'
+film_context = 'hidden'
+film_scale = 0.1
