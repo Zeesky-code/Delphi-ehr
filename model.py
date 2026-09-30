@@ -232,6 +232,15 @@ class Delphi(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
+        # Re-apply zero init to FiLM output layers — self.apply() above overwrites the
+        # zero-init done in FiLMLayer.__init__, breaking the identity-at-start property
+        if config.use_film:
+            for block in self.transformer.h:
+                nn.init.zeros_(block.film_attn.film_gen[-1].weight)
+                nn.init.zeros_(block.film_attn.film_gen[-1].bias)
+                nn.init.zeros_(block.film_mlp.film_gen[-1].weight)
+                nn.init.zeros_(block.film_mlp.film_gen[-1].bias)
+
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
