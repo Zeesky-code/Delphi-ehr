@@ -101,6 +101,44 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation: γ ⊙ x + β conditioned on numeric values."""
+
+    def __init__(self, config):
+        super().__init__()
+        # Input: token embedding (for measurement-type context) + raw value + z-score
+        # We project token embedding down to 16 dims to keep FiLM lightweight
+        self.tok_proj = nn.Linear(config.n_embd, 16, bias=False)
+        self.film_gen = nn.Sequential(
+            nn.Linear(16 + 2, config.n_embd),  # 16 tok_proj + raw_value + z_score
+            nn.GELU(),
+            nn.Linear(config.n_embd, 2 * config.n_embd),  # γ and β
+        )
+        # Zero-init output so FiLM starts as identity (γ=0, β=0 → after processing: γ=1, β=0)
+        nn.init.zeros_(self.film_gen[-1].weight)
+        nn.init.zeros_(self.film_gen[-1].bias)
+
+    def forward(self, x, numeric_values, has_numeric):
+        """
+        Args:
+            x: (B, T, C) hidden states
+            numeric_values: (B, T, 2) — [raw_value, z_score] per token
+            has_numeric: (B, T) bool — which tokens have numeric values
+        Returns:
+            Modulated x: (B, T, C)
+        """
+        tok_ctx = self.tok_proj(x.detach())  # (B, T, 16) — detached to avoid gradient shortcuts
+        cond = torch.cat([tok_ctx, numeric_values], dim=-1)  # (B, T, 18)
+        film_params = self.film_gen(cond)  # (B, T, 2*C)
+        gamma, beta = film_params.chunk(2, dim=-1)  # each (B, T, C)
+
+        # Only apply modulation where numeric values exist; identity otherwise
+        mask = has_numeric.unsqueeze(-1).float()  # (B, T, 1)
+        gamma = gamma * mask  # Zero where no numeric → γ_effective = 1
+        beta = beta * mask    # Zero where no numeric → β_effective = 0
+
+        return (1 + gamma) * x + beta  # (1+γ) so that zero-init → identity
+    
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -109,11 +147,19 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        self.use_film = getattr(config, 'use_film', False)
+        if self.use_film:
+            self.film_attn = FiLMLayer(config)
+            self.film_mlp = FiLMLayer(config)
 
-    def forward(self, x, attn_mask):
-        y, att = self.attn(self.ln_1(x), attn_mask) 
+    def forward(self, x, attn_mask, numeric_values=None, has_numeric=None):
+        y, att = self.attn(self.ln_1(x), attn_mask)
         x = x + y
+        if self.use_film and numeric_values is not None:
+            x = self.film_attn(x, numeric_values, has_numeric)
         x = x + self.mlp(self.ln_2(x))
+        if self.use_film and numeric_values is not None:
+            x = self.film_mlp(x, numeric_values, has_numeric)
         return x, att
 
 class AgeEncoding(nn.Module):
@@ -150,6 +196,7 @@ class DelphiConfig:
     t_min: float = 1.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     mask_ties: bool = False
+    use_film: bool = False  # allow FiLM layers for numeric value encoding
     ignore_tokens: list = field(default_factory=lambda: [0])
 
 class Delphi(nn.Module):
@@ -208,7 +255,7 @@ class Delphi(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False):
+    def forward(self, idx, age, targets=None, targets_age=None, numeric_values=None, validation_loss_mode=False):
         device = idx.device
         b, t = idx.size()
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -232,8 +279,11 @@ class Delphi(nn.Module):
 
         
         att = []
+        has_numeric = None
+        if numeric_values is not None and self.config.use_film:
+            has_numeric = (numeric_values[..., 0] != 0)  # raw value != 0 means has numeric
         for block in self.transformer.h:
-            x, a = block(x, attn_mask)
+            x, a = block(x, attn_mask, numeric_values, has_numeric)
             att.append(a)
         x = self.transformer.ln_f(x)
         att = torch.stack(att)
@@ -354,7 +404,7 @@ class Delphi(nn.Module):
         return optimizer
 
     @torch.no_grad()
-    def generate(self, idx, age, max_new_tokens=100, max_age=85*365.25, no_repeat=True, termination_tokens=None, top_k=None):
+    def generate(self, idx, age, numeric_values=None, max_new_tokens=100, max_age=85*365.25, no_repeat=True, termination_tokens=None, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -362,6 +412,10 @@ class Delphi(nn.Module):
 
         Selected parameters:
         --------------------
+
+        numeric_values: Tensor of shape (b, t, 2) or None — [raw_value, z_score] per token.
+        If provided, FiLM conditioning is applied during generation. Generated tokens
+        receive zero values (no numeric modulation).
 
         termination_tokens: list[int] -  a list of tokens that indicate the and of the trajectory.
         Usually it is the "Death" token, but could be several tokens e.g. to indicate different
@@ -379,7 +433,7 @@ class Delphi(nn.Module):
             max_new_tokens = 128
 
         for _ in range(max_new_tokens):
-            logits, _, _ = self(idx, age)
+            logits, _, _ = self(idx, age, numeric_values=numeric_values)
             logits = logits[:, -1, :]
             logits[:,self.config.ignore_tokens] = -torch.inf
 
@@ -396,13 +450,18 @@ class Delphi(nn.Module):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
             age = torch.cat((age, age_next), dim=1)
+
+            # append zero numeric values for generated tokens (no lab value to condition on)
+            if numeric_values is not None:
+                zero_vals = torch.zeros(numeric_values.size(0), 1, 2, device=numeric_values.device, dtype=numeric_values.dtype)
+                numeric_values = torch.cat((numeric_values, zero_vals), dim=1)
             
             if torch.logical_or(torch.isin(idx, termination_tokens).any(-1), age_next > max_age).all():
                 break
         
         pad = (torch.cumsum(torch.cumsum(torch.isin(idx, termination_tokens), 1).bool().int(), 1) > 1) + (age > max_age)
 
-        logits, _, _ = self(idx, age)
+        logits, _, _ = self(idx, age, numeric_values=numeric_values)
         idx[pad] = 0
         age[pad] = mask_time
 

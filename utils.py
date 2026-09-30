@@ -25,7 +25,8 @@ def get_p2i(data):
 
 def get_batch(ix, data, p2i, select='random', index='patient', padding='regular',
               block_size=48, device='cpu', lifestyle_augmentations=False, 
-              no_event_token_rate=5, cut_batch=False):
+              no_event_token_rate=5, cut_batch=False,
+              values_data=None, values_stats=None):
     """
     Get a batch of data from the dataset. This function packs sequences in a batch and also
     inserts "no event" tokens randomly with the average rate of one every five years.
@@ -42,12 +43,15 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
         lifestyle_augmentations: whether to perform aurmentations of lifestyle token times
         no_event_token_rate: average rate of "no event" tokens in years
         cut_batch: whether to cut the batch to the smallest size possible
+        values_data: numpy array of float32 numeric values parallel to data (one value per row), or None
+        values_stats: dict of {token_id: (mean, std)} for z-score computation, or None
 
     Returns:
         x: input tokens
         a: input ages
         y: target tokens
         b: target ages
+        v: numeric values (B, T, 2) with [raw_value, z_score] — only returned if values_data is not None
     """
 
     mask_time = -10000.
@@ -82,6 +86,12 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
     tokens = torch.from_numpy(data[:, 2][batch_idx].astype(np.int64))
     ages = torch.from_numpy(data[:, 1][batch_idx].astype(np.float32))
 
+    # Extract numeric values if available
+    has_values = values_data is not None
+    if has_values:
+        raw_vals = torch.from_numpy(values_data[batch_idx].astype(np.float32))
+        raw_vals = raw_vals.masked_fill(~mask, 0.0)
+
     tokens = tokens.masked_fill(~mask, -1)
     ages = ages.masked_fill(~mask, mask_time)
 
@@ -112,14 +122,22 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
     tokens = torch.hstack([tokens, torch.zeros_like(pad, dtype=torch.int)])
     ages = torch.hstack([ages, pad])
 
+    # Also extend values with zeros for "no event" padding tokens
+    if has_values:
+        raw_vals = torch.hstack([raw_vals, torch.zeros(len(ix), pad.shape[1])])
+
     # mask out "no event" tokens that are too far in the future (i.e. after the last real token)
     tokens = tokens.masked_fill(ages > m, -1)
     ages = ages.masked_fill(ages > m, mask_time)
+    if has_values:
+        raw_vals = raw_vals.masked_fill(ages > m, 0.0)
 
     # sort everything so that things are correctly ordered about stacking
     s = torch.argsort(ages, 1)
     tokens = torch.gather(tokens, 1, s)
     ages = torch.gather(ages, 1, s)
+    if has_values:
+        raw_vals = torch.gather(raw_vals, 1, s)
 
     # a technical detail: the token 0 is reserved for padding, so we shift all tokens by one
     tokens = tokens + 1
@@ -129,6 +147,8 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
         cut_margin = torch.min(torch.sum(tokens == 0, 1))
         tokens = tokens[:, cut_margin:]
         ages = ages[:, cut_margin:]
+        if has_values:
+            raw_vals = raw_vals[:, cut_margin:]
 
     # cut to maintain the block size
     #TODO it would be better to use the strategy defined by the "select" parameter
@@ -136,23 +156,47 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
         cut_margin = tokens.shape[1] - block_size - 1
         tokens = tokens[:, cut_margin:]
         ages = ages[:, cut_margin:]
+        if has_values:
+            raw_vals = raw_vals[:, cut_margin:]
 
     # shift by one to generate targets
     x = tokens[:, :-1]
     a = ages[:, :-1]
     y = tokens[:, 1:]
     b = ages[:, 1:]
+    if has_values:
+        v = raw_vals[:, :-1]  # values align with input tokens, not targets
 
     # if the first token is a "no event" token, mask it and the corresponding target
     x = x.masked_fill((x == 0) * (y == 1), 0)
     y = y.masked_fill(x == 0, 0)
     b = b.masked_fill(x == 0, mask_time)
+    if has_values:
+        v = v.masked_fill(x == 0, 0.0)
+
+    # Compute z-scores and pack as (B, T, 2): [raw_value, z_score]
+    if has_values:
+        z_scores = torch.zeros_like(v)
+        if values_stats is not None:
+            # x contains token IDs (already shifted by +1), so original token IDs are x-1
+            for tok_id, (mean, std) in values_stats.items():
+                tok_mask = (x == tok_id + 1) & (v != 0)  # +1 because tokens are shifted
+                if tok_mask.any() and std > 0:
+                    z_scores[tok_mask] = (v[tok_mask] - mean) / std
+        v = torch.stack([v, z_scores], dim=-1)  # (B, T, 2)
 
     if device == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, a, y, b = [i.pin_memory().to(device, non_blocking=True) for i in [x, a, y, b]]
+        if has_values:
+            v = v.pin_memory().to(device, non_blocking=True)
     else:
         x, a, y, b = x.to(device), a.to(device), y.to(device), b.to(device)
+        if has_values:
+            v = v.to(device)
+
+    if has_values:
+        return x, a, y, b, v
     return x, a, y, b
 
 

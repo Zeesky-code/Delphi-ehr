@@ -62,6 +62,7 @@ compile = False  # use PyTorch 2.0 to compile the model to be faster
 token_dropout = 0.0
 t_min = 0.0  # 365.25/12.
 mask_ties = True
+use_film = False
 ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
@@ -91,6 +92,27 @@ data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint32, mode='r').reshape(-1, 3)
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r').reshape(-1, 3)
 
+# Load numeric values if available (parallel float32 arrays)
+train_values_path = os.path.join(data_dir, 'train_values.bin')
+val_values_path = os.path.join(data_dir, 'val_values.bin')
+if use_film and os.path.exists(train_values_path):
+    train_values = np.memmap(train_values_path, dtype=np.float32, mode='r')
+    val_values = np.memmap(val_values_path, dtype=np.float32, mode='r')
+    # Compute per-token-type statistics for z-score normalization
+    values_stats = {}
+    for tok_id in range(vocab_size):
+        tok_mask = (train_data[:, 2] == tok_id) & (train_values != 0)
+        if tok_mask.sum() > 100:  # need enough samples for stable stats
+            vals = train_values[tok_mask]
+            values_stats[tok_id] = (float(vals.mean()), float(vals.std()))
+    print(f"Loaded numeric values for {len(values_stats)} token types")
+else:
+    train_values = None
+    val_values = None
+    values_stats = None
+    if use_film:
+        print("WARNING: use_film=True but no values files found, FiLM will act as identity")
+
 train_p2i = get_p2i(train_data)
 val_p2i = get_p2i(val_data)
 
@@ -108,7 +130,7 @@ print(f"found vocab_size = {vocab_size}")
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=vocab_size, dropout=dropout, token_dropout=token_dropout, t_min=t_min,
-                  mask_ties=mask_ties, ignore_tokens=ignore_tokens)  # start with model_args from command line
+                  mask_ties=mask_ties, use_film=use_film, ignore_tokens=ignore_tokens)  # start with model_args from command line
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -169,12 +191,19 @@ def estimate_loss():
         p2i = train_p2i if split == 'train' else val_p2i
         for k in range(eval_iters):
             ix = torch.randint(len(p2i), (batch_size,))
-            X, A, Y, B = get_batch(ix, data, p2i, block_size=block_size,
+            vd = train_values if split == 'train' else val_values
+            batch_out = get_batch(ix, data, p2i, block_size=block_size,
                                    device=device, select='left',
                                    no_event_token_rate=no_event_token_rate, 
-                                   cut_batch=True)
+                                   cut_batch=True,
+                                   values_data=vd, values_stats=values_stats)
+            if len(batch_out) == 5:
+                X, A, Y, B, V = batch_out
+            else:
+                X, A, Y, B = batch_out
+                V = None
             with ctx:
-                logits, loss, _ = model(X, A, Y, B, validation_loss_mode=True)
+                logits, loss, _ = model(X, A, Y, B, numeric_values=V, validation_loss_mode=True)
             losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
         out[split] = losses.mean(0)
     model.train()
@@ -203,9 +232,15 @@ if wandb_log:
 
 # training loop
 ix = torch.randint(len(train_p2i), (batch_size,))
-X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
+batch_out = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
                        padding='random', lifestyle_augmentations=True, select='left',
-                       no_event_token_rate=no_event_token_rate)
+                       no_event_token_rate=no_event_token_rate,
+                       values_data=train_values, values_stats=values_stats)
+if len(batch_out) == 5:
+    X, A, Y, B, V = batch_out
+else:
+    X, A, Y, B = batch_out
+    V = None
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 
@@ -265,12 +300,18 @@ while True:
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            logits, loss, att = model(X, A, Y, B)
+            logits, loss, att = model(X, A, Y, B, numeric_values=V)
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         ix = torch.randint(len(train_p2i), (batch_size,))
-        X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
+        batch_out = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
                                padding='random', lifestyle_augmentations=True, select='left',
-                               no_event_token_rate=no_event_token_rate, cut_batch=True)
+                               no_event_token_rate=no_event_token_rate, cut_batch=True,
+                               values_data=train_values, values_stats=values_stats)
+        if len(batch_out) == 5:
+            X, A, Y, B, V = batch_out
+        else:
+            X, A, Y, B = batch_out
+            V = None
 
         # backward pass, with gradient scaling if training in fp16
         loss = loss['loss_ce'] + loss['loss_dt']
