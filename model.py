@@ -59,11 +59,19 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, attn_mask):
+        self.film_qkv = None
+        if getattr(config, 'use_film', False) and getattr(config, 'film_location', 'both') == 'qkv':
+            self.film_qkv = FiLMLayer(config, output_dim=3 * config.n_embd)
+
+    def forward(self, x, attn_mask, numeric_values=None, has_numeric=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        qkv = self.c_attn(x)
+        if self.film_qkv is not None and numeric_values is not None:
+            gamma, beta = self.film_qkv.get_params(x, numeric_values, has_numeric)
+            qkv = (1 + gamma) * qkv + beta
+        q, k ,v  = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -88,7 +96,7 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, output_dim=None):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
@@ -104,11 +112,12 @@ class MLP(nn.Module):
 class FiLMLayer(nn.Module):
     """Feature-wise Linear Modulation: γ ⊙ x + β conditioned on numeric values."""
 
-    def __init__(self, config):
+    def __init__(self, config, output_dim=None):
         super().__init__()
         self.context_mode = getattr(config, 'film_context', 'hidden')
         self.film_mode = getattr(config, 'film_mode', 'both')
         self.film_scale = getattr(config, 'film_scale', 0.1)
+        self.output_dim = output_dim if output_dim is not None else config.n_embd
         if self.context_mode not in ('hidden', 'numeric'):
             raise ValueError(f"Unknown film_context: {self.context_mode}")
         if self.film_mode not in ('both', 'gamma', 'beta'):
@@ -124,13 +133,13 @@ class FiLMLayer(nn.Module):
         self.film_gen = nn.Sequential(
             nn.Linear(condition_dim, config.n_embd),
             nn.GELU(),
-            nn.Linear(config.n_embd, 2 * config.n_embd),  # γ and β
+            nn.Linear(config.n_embd, 2 * self.output_dim),  # γ and β
         )
         # Zero-init output so FiLM starts as identity (γ=0, β=0 → after processing: γ=1, β=0)
         nn.init.zeros_(self.film_gen[-1].weight)
         nn.init.zeros_(self.film_gen[-1].bias)
 
-    def forward(self, x, numeric_values, has_numeric):
+    def get_params(self, x, numeric_values, has_numeric):
         """
         Args:
             x: (B, T, C) hidden states
@@ -145,7 +154,7 @@ class FiLMLayer(nn.Module):
         else:
             cond = numeric_values
         film_params = self.film_gen(cond)
-        gamma, beta = film_params.chunk(2, dim=-1)  # each (B, T, C)
+        gamma, beta = film_params.chunk(2, dim=-1)
         # Keep repeated modulation across blocks close to the identity.
         gamma = self.film_scale * torch.tanh(gamma)
         beta = self.film_scale * torch.tanh(beta)
@@ -159,6 +168,13 @@ class FiLMLayer(nn.Module):
         gamma = gamma * mask  # Zero where no numeric → γ_effective = 1
         beta = beta * mask    # Zero where no numeric → β_effective = 0
 
+        return gamma, beta
+
+    def forward(self, x, numeric_values, has_numeric):
+        if self.output_dim != x.size(-1):
+            raise ValueError('FiLMLayer output_dim must match x for direct modulation')
+        gamma, beta = self.get_params(x, numeric_values, has_numeric)
+
         return (1 + gamma) * x + beta  # (1+γ) so that zero-init → identity
     
 class Block(nn.Module):
@@ -171,7 +187,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.use_film = getattr(config, 'use_film', False)
         self.film_location = getattr(config, 'film_location', 'both')
-        if self.film_location not in ('both', 'attn', 'attn_pre', 'mlp'):
+        if self.film_location not in ('both', 'attn', 'attn_pre', 'qkv', 'mlp'):
             raise ValueError(f"Unknown film_location: {self.film_location}")
         if self.use_film:
             self.film_attn = FiLMLayer(config)
@@ -181,7 +197,7 @@ class Block(nn.Module):
         attn_input = self.ln_1(x)
         if self.use_film and numeric_values is not None and self.film_location == 'attn_pre':
             attn_input = self.film_attn(attn_input, numeric_values, has_numeric)
-        y, att = self.attn(attn_input, attn_mask)
+        y, att = self.attn(attn_input, attn_mask, numeric_values, has_numeric)
         x = x + y
         if self.use_film and numeric_values is not None and self.film_location in ('both', 'attn'):
             x = self.film_attn(x, numeric_values, has_numeric)
@@ -226,7 +242,7 @@ class DelphiConfig:
     mask_ties: bool = False
     use_film: bool = False  # allow FiLM layers for numeric value encoding
     film_mode: str = 'both'  # 'both', 'gamma', or 'beta'
-    film_location: str = 'both'  # 'both', 'attn', or 'mlp'
+    film_location: str = 'both'  # 'both', 'attn', 'attn_pre', 'qkv', or 'mlp'
     film_context: str = 'hidden'  # 'hidden' or 'numeric'
     film_scale: float = 0.1
     ignore_tokens: list = field(default_factory=lambda: [0])
@@ -272,6 +288,9 @@ class Delphi(nn.Module):
                 nn.init.zeros_(block.film_attn.film_gen[-1].bias)
                 nn.init.zeros_(block.film_mlp.film_gen[-1].weight)
                 nn.init.zeros_(block.film_mlp.film_gen[-1].bias)
+                if block.attn.film_qkv is not None:
+                    nn.init.zeros_(block.attn.film_qkv.film_gen[-1].weight)
+                    nn.init.zeros_(block.attn.film_qkv.film_gen[-1].bias)
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
