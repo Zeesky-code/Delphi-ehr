@@ -171,14 +171,17 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.use_film = getattr(config, 'use_film', False)
         self.film_location = getattr(config, 'film_location', 'both')
-        if self.film_location not in ('both', 'attn', 'mlp'):
+        if self.film_location not in ('both', 'attn', 'attn_pre', 'mlp'):
             raise ValueError(f"Unknown film_location: {self.film_location}")
         if self.use_film:
             self.film_attn = FiLMLayer(config)
             self.film_mlp = FiLMLayer(config)
 
     def forward(self, x, attn_mask, numeric_values=None, has_numeric=None):
-        y, att = self.attn(self.ln_1(x), attn_mask)
+        attn_input = self.ln_1(x)
+        if self.use_film and numeric_values is not None and self.film_location == 'attn_pre':
+            attn_input = self.film_attn(attn_input, numeric_values, has_numeric)
+        y, att = self.attn(attn_input, attn_mask)
         x = x + y
         if self.use_film and numeric_values is not None and self.film_location in ('both', 'attn'):
             x = self.film_attn(x, numeric_values, has_numeric)
