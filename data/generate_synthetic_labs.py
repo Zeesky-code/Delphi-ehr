@@ -3,7 +3,7 @@ Generate synthetic lab test data extending the existing Delphi synthetic dataset
 
 This script:
 1. Loads the existing synthetic train/val data
-2. Defines 10 common lab test types as new tokens (IDs 1269–1278)
+2. Defines 10 common lab test types as new tokens after the existing labels
 3. For each patient, generates periodic lab measurements at realistic intervals
 4. Correlates lab values with disease events where medically relevant
 5. Saves extended data to a new directory: data/ukb_simulated_data_with_labs/
@@ -114,21 +114,25 @@ def find_disease_tokens(labels, keywords):
     return set(matching)
 
 
-def build_correlation_map(labels):
+def build_correlation_map(labels, lab_token_offset=0):
     """
     Build a mapping: disease_token_id → {lab_token_id: (shift_mean, shift_std)}.
     """
     corr_map = {}
     for group_name, group_info in DISEASE_LAB_CORRELATIONS.items():
         matching_tokens = find_disease_tokens(labels, group_info["keywords"])
+        remapped_effects = {
+            lab_token + lab_token_offset: effect
+            for lab_token, effect in group_info["effects"].items()
+        }
         for tok in matching_tokens:
             if tok not in corr_map:
                 corr_map[tok] = {}
-            corr_map[tok].update(group_info["effects"])
+            corr_map[tok].update(remapped_effects)
     return corr_map
 
 
-def generate_labs_for_patient(patient_data, corr_map, rng):
+def generate_labs_for_patient(patient_data, corr_map, rng, lab_tests=LAB_TESTS):
     """
     Generate lab test events for a single patient.
 
@@ -157,7 +161,7 @@ def generate_labs_for_patient(patient_data, corr_map, rng):
     lab_events = []
     lab_values = []
 
-    for lab_token, (name, unit, mean, std, min_v, max_v, freq) in LAB_TESTS.items():
+    for lab_token, (name, unit, mean, std, min_v, max_v, freq) in lab_tests.items():
         # Generate measurement times: periodic with jitter
         freq_days = freq * 365.25
         # Start measurements from a realistic age (e.g., 40+) or from first event
@@ -211,7 +215,7 @@ def generate_labs_for_patient(patient_data, corr_map, rng):
     return np.array(lab_events, dtype=np.uint32), np.array(lab_values, dtype=np.float32)
 
 
-def process_dataset(data, corr_map, rng):
+def process_dataset(data, corr_map, rng, lab_tests=LAB_TESTS):
     """
     Process an entire dataset: add lab events and generate numeric values.
 
@@ -237,7 +241,7 @@ def process_dataset(data, corr_map, rng):
         orig_values = np.zeros(len(patient_data), dtype=np.float32)
 
         # Generate lab data
-        lab_events, lab_values = generate_labs_for_patient(patient_data, corr_map, rng)
+        lab_events, lab_values = generate_labs_for_patient(patient_data, corr_map, rng, lab_tests)
 
         # Merge
         if len(lab_events) > 0:
@@ -269,13 +273,18 @@ def main():
 
     # Load labels and build correlation map
     labels = load_labels(src_dir / "labels.csv")
-    corr_map = build_correlation_map(labels)
+    lab_token_offset = len(labels) - min(LAB_TESTS)
+    lab_tests = {
+        lab_token + lab_token_offset: definition
+        for lab_token, definition in LAB_TESTS.items()
+    }
+    corr_map = build_correlation_map(labels, lab_token_offset)
     print(f"Found disease-lab correlations for {len(corr_map)} disease tokens")
 
     # Extend labels with lab test names
     extended_labels = labels.copy()
-    for lab_token in sorted(LAB_TESTS.keys()):
-        name, unit, *_ = LAB_TESTS[lab_token]
+    for lab_token in sorted(lab_tests.keys()):
+        name, unit, *_ = lab_tests[lab_token]
         extended_labels.append(f"{name} ({unit})")
 
     # Save extended labels
@@ -290,7 +299,7 @@ def main():
         data = np.fromfile(src_dir / f"{split}.bin", dtype=np.uint32).reshape(-1, 3)
         print(f"  Original: {len(data)} records")
 
-        extended_data, values = process_dataset(data, corr_map, rng)
+        extended_data, values = process_dataset(data, corr_map, rng, lab_tests)
         print(f"  Extended: {len(extended_data)} records (+{len(extended_data) - len(data)} lab events)")
         print(f"  Lab values range: {values[values > 0].min():.1f} - {values[values > 0].max():.1f}")
 
@@ -316,7 +325,7 @@ def main():
     print("="*60)
     data = np.fromfile(dst_dir / "train.bin", dtype=np.uint32).reshape(-1, 3)
     values = np.fromfile(dst_dir / "train_values.bin", dtype=np.float32)
-    for lab_token, (name, unit, mean, std, min_v, max_v, freq) in LAB_TESTS.items():
+    for lab_token, (name, unit, mean, std, min_v, max_v, freq) in lab_tests.items():
         mask = data[:, 2] == lab_token
         if mask.sum() > 0:
             v = values[mask]

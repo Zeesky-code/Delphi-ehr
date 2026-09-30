@@ -24,7 +24,7 @@ n_head = 12
 n_embd = 120
 dropout = 0.0
 weight_decay = 2e-1
-vocab_size = 1280  # was 1270, +10 lab tokens
+vocab_size = 1281  # 1280 labels plus the reserved padding token
 
 learning_rate = 2e-3
 max_iters = 5000

@@ -122,7 +122,7 @@ class FiLMLayer(nn.Module):
         """
         Args:
             x: (B, T, C) hidden states
-            numeric_values: (B, T, 2) — [raw_value, z_score] per token
+            numeric_values: (B, T, 2) — standardized value channels per token
             has_numeric: (B, T) bool — which tokens have numeric values
         Returns:
             Modulated x: (B, T, C)
@@ -131,6 +131,9 @@ class FiLMLayer(nn.Module):
         cond = torch.cat([tok_ctx, numeric_values], dim=-1)  # (B, T, 18)
         film_params = self.film_gen(cond)  # (B, T, 2*C)
         gamma, beta = film_params.chunk(2, dim=-1)  # each (B, T, C)
+        # Keep repeated modulation across blocks close to the identity.
+        gamma = 0.1 * torch.tanh(gamma)
+        beta = 0.1 * torch.tanh(beta)
 
         # Only apply modulation where numeric values exist; identity otherwise
         mask = has_numeric.unsqueeze(-1).float()  # (B, T, 1)
