@@ -6,6 +6,9 @@
 #   scripts/run_film_variants.sh                         # every variant
 #   scripts/run_film_variants.sh baseline qkv attn_pre   # just these
 #   scripts/run_film_variants.sh qkv -- --device=cuda --max_iters=2000   # extra train.py args after --
+#   scripts/run_film_variants.sh -- --device=cuda --wandb_log=True       # log to wandb
+#
+# With wandb on, each run is named <variant>-seed<seed> and grouped by variant, so seeds average together.
 #
 # Environment:
 #   SEEDS="42 43 44"   seeds to run (default 42); use several before trusting small differences
@@ -61,6 +64,7 @@ while read -r name config overrides; do
         echo "=== $name (seed $seed) -> $out"
         # shellcheck disable=SC2086  # overrides is a word list on purpose
         "$PYTHON" train.py "$config" $overrides --seed="$seed" --out_dir="$out" \
+            --wandb_run_name="$name-seed$seed" --wandb_group="$name" \
             ${extra[@]+"${extra[@]}"} 2>&1 | tee "$out/train.log"
     done
 done <<< "$VARIANTS"

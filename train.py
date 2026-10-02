@@ -25,6 +25,7 @@ seed = 42
 wandb_log = False  # disabled by default
 wandb_project = 'delphi'
 wandb_run_name = 'run' + str(time.time())
+wandb_group = ''  # runs in the same group (e.g. one FiLM variant over several seeds) are averaged in the UI
 
 # data
 dataset = 'ukb_simulated_data'
@@ -241,7 +242,10 @@ def get_lr(it):
 # logging
 if wandb_log:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    raw_model = unoptimized_model if compile else model
+    wandb.init(project=wandb_project, name=wandb_run_name, group=wandb_group or None,
+               config={**config, 'n_params': raw_model.get_num_params(),
+                       'n_film_params': raw_model.get_num_film_params()})
 
 # training loop
 X, A, Y, B, V = fetch_batch('train', padding='random', lifestyle_augmentations=True)
@@ -367,3 +371,6 @@ summary = {
 with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
     json.dump(summary, f, indent=2)
 print(f"wrote {os.path.join(out_dir, 'summary.json')}")
+if wandb_log:
+    wandb.run.summary.update({k: v for k, v in summary.items() if v is not None})
+    wandb.finish()
