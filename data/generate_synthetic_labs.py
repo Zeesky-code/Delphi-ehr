@@ -4,9 +4,14 @@ Generate synthetic lab test data extending the existing Delphi synthetic dataset
 This script:
 1. Loads the existing synthetic train/val data
 2. Defines 10 common lab test types as new tokens after the existing labels
-3. For each patient, generates periodic lab measurements at realistic intervals
+3. For each patient, simulates sparse clinic visits from age 40, each measuring a random subset of labs
 4. Correlates lab values with disease events where medically relevant
 5. Saves extended data to a new directory: data/ukb_simulated_data_with_labs/
+
+Token ids: the .bin files store raw ids, and get_batch() shifts every id by +1 so that 0 can be
+padding. Raw id k therefore corresponds to labels.csv entry k+1 (0-based). The original data uses
+raw ids up to 1268 (Death, entry 1269), so the lab tokens are raw ids 1269..1278 (entries 1270..1279)
+and model ids 1270..1279.
 
 Output format:
   - train.bin / val.bin   : uint32 (patient_id, age_in_days, token_id) — same as original + new lab tokens
@@ -16,25 +21,36 @@ Output format:
 
 import numpy as np
 import os
+import pickle
+import re
 import shutil
 from pathlib import Path
 
 np.random.seed(42)
 
 # ─── Lab Test Definitions ───────────────────────────────────────────────────────
-# Each lab test: (name, unit, normal_mean, normal_std, min_val, max_val, frequency_years)
+# Keys are raw token ids (see module docstring).
+# Each lab test: (name, unit, normal_mean, normal_std, min_val, max_val, prob_measured_per_visit)
 LAB_TESTS = {
-    1269: ("HbA1c",           "%",      5.5,   0.5,   3.5,  15.0,  2.0),
-    1270: ("Glucose_fasting", "mmol/L", 5.0,   0.6,   2.5,  25.0,  2.0),
-    1271: ("Cholesterol_total","mmol/L", 5.2,   1.0,   2.0,  12.0,  3.0),
-    1272: ("HDL",             "mmol/L",  1.5,   0.4,   0.5,   3.5,  3.0),
-    1273: ("LDL",             "mmol/L",  3.0,   0.9,   0.5,   8.0,  3.0),
-    1274: ("Systolic_BP",     "mmHg",  120.0,  12.0,  80.0, 220.0,  1.0),
-    1275: ("Creatinine",      "umol/L", 80.0,  15.0,  30.0, 600.0,  2.0),
-    1276: ("ALT",             "U/L",    25.0,  10.0,   5.0, 300.0,  3.0),
-    1277: ("Hemoglobin",      "g/dL",   14.0,   1.5,   5.0,  20.0,  2.0),
-    1278: ("CRP",             "mg/L",    2.0,   2.0,   0.1, 200.0,  3.0),
+    1269: ("HbA1c",           "%",      5.5,   0.5,   3.5,  15.0,  0.2),
+    1270: ("Glucose_fasting", "mmol/L", 5.0,   0.6,   2.5,  25.0,  0.2),
+    1271: ("Cholesterol_total","mmol/L", 5.2,   1.0,   2.0,  12.0,  0.2),
+    1272: ("HDL",             "mmol/L",  1.5,   0.4,   0.5,   3.5,  0.2),
+    1273: ("LDL",             "mmol/L",  3.0,   0.9,   0.5,   8.0,  0.2),
+    1274: ("Systolic_BP",     "mmHg",  120.0,  12.0,  80.0, 220.0,  0.5),
+    1275: ("Creatinine",      "umol/L", 80.0,  15.0,  30.0, 600.0,  0.2),
+    1276: ("ALT",             "U/L",    25.0,  10.0,   5.0, 300.0,  0.2),
+    1277: ("Hemoglobin",      "g/dL",   14.0,   1.5,   5.0,  20.0,  0.2),
+    1278: ("CRP",             "mg/L",    2.0,   2.0,   0.1, 200.0,  0.2),
 }
+
+# Clinic visits start at this age and follow with exponential gaps of this mean.
+# Labs are kept sparse (~15 per patient) so they don't crowd disease events out of the context.
+VISIT_START_AGE_YEARS = 40.0
+VISIT_MEAN_GAP_YEARS = 6.0
+
+# Raw token ids of the original data that are not diseases (no event, sex, lifestyle)
+FIRST_DISEASE_RAW_TOKEN = 12
 
 # Disease tokens that correlate with specific lab tests
 # Format: {disease_token_range: {lab_token: (value_shift_mean, value_shift_std)}}
@@ -74,7 +90,7 @@ DISEASE_LAB_CORRELATIONS = {
     },
     # Kidney diseases → elevated creatinine
     "kidney_keywords": {
-        "keywords": ["renal", "kidney", "N17", "N18", "N19"],
+        "keywords": ["renal failure", "kidney disease", "N17", "N18", "N19"],
         "effects": {
             1275: (100.0, 50.0),  # Creatinine: +100
         }
@@ -103,15 +119,28 @@ def load_labels(labels_path):
 
 
 def find_disease_tokens(labels, keywords):
-    """Find token IDs whose labels match any of the keywords (case-insensitive)."""
-    matching = []
+    """
+    Find raw token IDs whose labels match any of the keywords.
+
+    ICD-10 code keywords (e.g. "E11") must equal the label's code; text keywords match the
+    start of a word, case-insensitive (so "renal" does not match "adrenal").
+    """
+    code_re = re.compile(r"^[A-Z]\d\d$")
+    matching = set()
     for idx, label in enumerate(labels):
-        label_lower = label.lower()
+        raw_token = idx - 1  # labels.csv entry k is raw token k-1 (get_batch shifts by +1)
+        if raw_token < FIRST_DISEASE_RAW_TOKEN:
+            continue
+        code = label.split()[0] if label else ""
         for kw in keywords:
-            if kw.lower() in label_lower:
-                matching.append(idx)
+            if code_re.match(kw):
+                hit = code == kw
+            else:
+                hit = re.search(r"\b" + re.escape(kw.lower()), label.lower()) is not None
+            if hit:
+                matching.add(raw_token)
                 break
-    return set(matching)
+    return matching
 
 
 def build_correlation_map(labels, lab_token_offset=0):
@@ -155,41 +184,35 @@ def generate_labs_for_patient(patient_data, corr_map, rng, lab_tests=LAB_TESTS):
     # Find which diseases this patient has and when
     patient_diseases = {}
     for age, tok in zip(ages, tokens):
-        if tok >= 13:  # Skip padding, sex, lifestyle tokens
+        if tok >= FIRST_DISEASE_RAW_TOKEN:  # Skip no event, sex, lifestyle tokens
             patient_diseases[tok] = age
 
     lab_events = []
     lab_values = []
 
-    for lab_token, (name, unit, mean, std, min_v, max_v, freq) in lab_tests.items():
-        # Generate measurement times: periodic with jitter
-        freq_days = freq * 365.25
-        # Start measurements from a realistic age (e.g., 40+) or from first event
-        start_age = max(min_age, 40 * 365.25)
-        if start_age >= max_age:
-            start_age = min_age + 365.25  # fallback: 1 year after first event
+    # Simulate clinic visits strictly inside the observed record, so no lab falls on or after
+    # the last event (often Death).
+    visit_ages = []
+    t = max(min_age, VISIT_START_AGE_YEARS * 365.25) + rng.exponential(VISIT_MEAN_GAP_YEARS * 365.25)
+    while t < max_age - 1:
+        visit_ages.append(int(t))
+        t += rng.exponential(VISIT_MEAN_GAP_YEARS * 365.25)
 
-        # Generate measurement timepoints
-        n_measurements = int((max_age - start_age) / freq_days) + 1
-        if n_measurements <= 0:
-            continue
+    for m_age in visit_ages:
+        for lab_token, (name, unit, mean, std, min_v, max_v, p_measure) in lab_tests.items():
+            if rng.random() >= p_measure:
+                continue
 
-        measure_ages = start_age + np.arange(n_measurements) * freq_days
-        # Add jitter (±30 days)
-        measure_ages += rng.uniform(-30, 30, size=n_measurements)
-        measure_ages = np.clip(measure_ages, min_age + 1, max_age)
-
-        for m_age in measure_ages:
             # Base value: normal distribution
             value = rng.normal(mean, std)
 
             # Age-related drift (many lab values trend upward with age)
             age_years = m_age / 365.25
-            if lab_token in (1269, 1270):  # HbA1c, Glucose trend up slightly
+            if name in ("HbA1c", "Glucose_fasting"):  # trend up slightly
                 value += (age_years - 50) * 0.02
-            elif lab_token == 1274:  # BP trends up
+            elif name == "Systolic_BP":  # BP trends up
                 value += (age_years - 50) * 0.3
-            elif lab_token == 1275:  # Creatinine trends up
+            elif name == "Creatinine":  # Creatinine trends up
                 value += (age_years - 50) * 0.5
 
             # Disease correlations: if patient has a correlated disease
@@ -206,7 +229,7 @@ def generate_labs_for_patient(patient_data, corr_map, rng, lab_tests=LAB_TESTS):
             # Clamp to realistic range
             value = np.clip(value, min_v, max_v)
 
-            lab_events.append([pid, int(m_age), lab_token])
+            lab_events.append([pid, m_age, lab_token])
             lab_values.append(value)
 
     if len(lab_events) == 0:
@@ -273,7 +296,8 @@ def main():
 
     # Load labels and build correlation map
     labels = load_labels(src_dir / "labels.csv")
-    lab_token_offset = len(labels) - min(LAB_TESTS)
+    # labels.csv entry k is raw token k-1, so the first new entry (index len(labels)) is raw len(labels)-1
+    lab_token_offset = (len(labels) - 1) - min(LAB_TESTS)
     lab_tests = {
         lab_token + lab_token_offset: definition
         for lab_token, definition in LAB_TESTS.items()
@@ -308,13 +332,23 @@ def main():
         values.astype(np.float32).tofile(dst_dir / f"{split}_values.bin")
 
         # Stats
-        n_lab = np.sum(extended_data[:, 2] >= 1269)
-        n_orig = np.sum(extended_data[:, 2] < 1269)
-        print(f"  Original tokens: {n_orig}, Lab tokens: {n_lab}")
+        is_lab = np.isin(extended_data[:, 2], list(lab_tests))
+        n_lab = np.sum(is_lab)
+        n_orig = np.sum(~is_lab)
+        print(f"  Original tokens: {n_orig}, Lab tokens: {n_lab} ({n_lab / len(extended_data):.0%} of rows)")
         print(f"  Avg lab events/patient: {n_lab / len(np.unique(extended_data[:, 0])):.1f}")
 
+    # meta.pkl: same structure as the original, extended to the new vocabulary
+    with open(src_dir / "meta.pkl", "rb") as f:
+        meta = pickle.load(f)
+    meta["vocab_size"] = len(extended_labels)
+    meta["itos"] = {i: i for i in range(len(extended_labels))}
+    meta["stoi"] = {i: i for i in range(len(extended_labels))}
+    with open(dst_dir / "meta.pkl", "wb") as f:
+        pickle.dump(meta, f)
+
     # Copy other necessary files
-    for fname in ["meta.pkl", "icd10_codes_mod.tsv", "fields.txt"]:
+    for fname in ["icd10_codes_mod.tsv", "fields.txt"]:
         src_file = src_dir / fname
         if src_file.exists():
             shutil.copy2(src_file, dst_dir / fname)
@@ -325,7 +359,7 @@ def main():
     print("="*60)
     data = np.fromfile(dst_dir / "train.bin", dtype=np.uint32).reshape(-1, 3)
     values = np.fromfile(dst_dir / "train_values.bin", dtype=np.float32)
-    for lab_token, (name, unit, mean, std, min_v, max_v, freq) in lab_tests.items():
+    for lab_token, (name, unit, mean, std, min_v, max_v, _) in lab_tests.items():
         mask = data[:, 2] == lab_token
         if mask.sum() > 0:
             v = values[mask]

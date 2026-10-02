@@ -38,7 +38,7 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, film_qkv=None):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -59,18 +59,15 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-        self.film_qkv = None
-        if getattr(config, 'use_film', False) and getattr(config, 'film_location', 'both') == 'qkv':
-            self.film_qkv = FiLMLayer(config, output_dim=3 * config.n_embd)
+        self.film_qkv = film_qkv
 
-    def forward(self, x, attn_mask, numeric_values=None, has_numeric=None):
+    def forward(self, x, attn_mask, values=None, value_mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
-        if self.film_qkv is not None and numeric_values is not None:
-            gamma, beta = self.film_qkv.get_params(x, numeric_values, has_numeric)
-            qkv = (1 + gamma) * qkv + beta
+        if self.film_qkv is not None and values is not None:
+            qkv = self.film_qkv(qkv, values, value_mask, context=x)
         q, k ,v  = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -96,7 +93,7 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config, output_dim=None):
+    def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
@@ -109,101 +106,119 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class FiLMLayer(nn.Module):
-    """Feature-wise Linear Modulation: γ ⊙ x + β conditioned on numeric values."""
+FILM_LOCATIONS = ('attn_pre', 'qkv', 'attn', 'mlp', 'both')
+FILM_MODES = ('both', 'gamma', 'beta')
+FILM_CONTEXTS = ('numeric', 'hidden')
+FILM_CONTEXT_DIM = 16  # size of the hidden-state projection fed to the generator when film_context='hidden'
 
-    def __init__(self, config, output_dim=None):
+
+def parse_film_layers(spec, n_layer):
+    """Turn film_layers ('all' or comma-separated block indices like '0,1') into a set of indices."""
+    if spec == 'all':
+        return set(range(n_layer))
+    layers = {int(i) for i in str(spec).split(',') if i.strip() != ''}
+    if not layers or not all(0 <= i < n_layer for i in layers):
+        raise ValueError(f"film_layers must be 'all' or indices in [0, {n_layer - 1}], got {spec!r}")
+    return layers
+
+
+class FiLM(nn.Module):
+    """
+    Feature-wise Linear Modulation conditioned on a token's numeric value:
+
+        h' = (1 + gamma) * h + beta,   gamma, beta = film_scale * tanh(generator(cond))
+
+    cond is the [z_score, has_value] pair, plus a small projection of the hidden state when
+    film_context='hidden'. The generator's last layer is zero-initialised, so FiLM starts as the
+    identity. Only positions in value_mask are modulated, and the generator only runs there.
+    """
+
+    def __init__(self, config, out_dim=None):
         super().__init__()
-        self.context_mode = getattr(config, 'film_context', 'hidden')
-        self.film_mode = getattr(config, 'film_mode', 'both')
-        self.film_scale = getattr(config, 'film_scale', 0.1)
-        self.output_dim = output_dim if output_dim is not None else config.n_embd
-        if self.context_mode not in ('hidden', 'numeric'):
-            raise ValueError(f"Unknown film_context: {self.context_mode}")
-        if self.film_mode not in ('both', 'gamma', 'beta'):
-            raise ValueError(f"Unknown film_mode: {self.film_mode}")
+        self.out_dim = out_dim or config.n_embd
+        self.mode = config.film_mode
+        self.scale = config.film_scale
+        hidden_dim = config.film_hidden_dim or config.n_embd
 
-        condition_dim = 2
-        if self.context_mode == 'hidden':
-            # Project hidden context down to keep FiLM lightweight.
-            self.tok_proj = nn.Linear(config.n_embd, 16, bias=False)
-            condition_dim += 16
-        else:
-            self.tok_proj = None
-        self.film_gen = nn.Sequential(
-            nn.Linear(condition_dim, config.n_embd),
+        cond_dim = 2
+        self.ctx_proj = None
+        if config.film_context == 'hidden':
+            # Detached, so FiLM reads the token's state without steering the main network through it
+            self.ctx_proj = nn.Linear(config.n_embd, FILM_CONTEXT_DIM, bias=False)
+            cond_dim += FILM_CONTEXT_DIM
+
+        n_outputs = 2 if self.mode == 'both' else 1
+        self.generator = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(config.n_embd, 2 * self.output_dim),  # γ and β
+            nn.Linear(hidden_dim, n_outputs * self.out_dim),
         )
-        # Zero-init output so FiLM starts as identity (γ=0, β=0 → after processing: γ=1, β=0)
-        nn.init.zeros_(self.film_gen[-1].weight)
-        nn.init.zeros_(self.film_gen[-1].bias)
+        self.reset_identity()
 
-    def get_params(self, x, numeric_values, has_numeric):
+    def reset_identity(self):
+        nn.init.zeros_(self.generator[-1].weight)
+        nn.init.zeros_(self.generator[-1].bias)
+
+    def forward(self, h, values, value_mask, context=None):
         """
         Args:
-            x: (B, T, C) hidden states
-            numeric_values: (B, T, 2) — standardized value channels per token
-            has_numeric: (B, T) bool — which tokens have numeric values
-        Returns:
-            Modulated x: (B, T, C)
+            h: (B, T, out_dim) features to modulate
+            values: (B, T, 2) [z_score, has_value] per token
+            value_mask: (B, T) bool, True where the token carries a value
+            context: (B, T, n_embd) hidden state for film_context='hidden'; defaults to h
         """
-        if self.context_mode == 'hidden':
-            tok_ctx = self.tok_proj(x.detach())  # (B, T, 16)
-            cond = torch.cat([tok_ctx, numeric_values], dim=-1)
+        cond = values[value_mask]  # (N, 2), N = number of valued tokens in the batch
+        if self.ctx_proj is not None:
+            context = h if context is None else context
+            cond = torch.cat([self.ctx_proj(context[value_mask].detach()), cond], dim=-1)
+        params = self.scale * torch.tanh(self.generator(cond))
+
+        gamma = torch.zeros_like(h)
+        beta = torch.zeros_like(h)
+        if self.mode == 'both':
+            gamma[value_mask], beta[value_mask] = params.chunk(2, dim=-1)
+        elif self.mode == 'gamma':
+            gamma[value_mask] = params
         else:
-            cond = numeric_values
-        film_params = self.film_gen(cond)
-        gamma, beta = film_params.chunk(2, dim=-1)
-        # Keep repeated modulation across blocks close to the identity.
-        gamma = self.film_scale * torch.tanh(gamma)
-        beta = self.film_scale * torch.tanh(beta)
-        if self.film_mode == 'gamma':
-            beta = torch.zeros_like(beta)
-        elif self.film_mode == 'beta':
-            gamma = torch.zeros_like(gamma)
+            beta[value_mask] = params
+        return (1 + gamma) * h + beta
 
-        # Only apply modulation where numeric values exist; identity otherwise
-        mask = has_numeric.unsqueeze(-1).float()  # (B, T, 1)
-        gamma = gamma * mask  # Zero where no numeric → γ_effective = 1
-        beta = beta * mask    # Zero where no numeric → β_effective = 0
 
-        return gamma, beta
-
-    def forward(self, x, numeric_values, has_numeric):
-        if self.output_dim != x.size(-1):
-            raise ValueError('FiLMLayer output_dim must match x for direct modulation')
-        gamma, beta = self.get_params(x, numeric_values, has_numeric)
-
-        return (1 + gamma) * x + beta  # (1+γ) so that zero-init → identity
-    
 class Block(nn.Module):
+    """
+    Transformer block. With FiLM on for this layer, film_location picks what gets modulated:
+        attn_pre  the normalised input to attention
+        qkv       the query, key and value projections
+        attn      the residual stream after the attention sub-layer
+        mlp       the residual stream after the MLP sub-layer
+        both      attn + mlp
+    """
 
-    def __init__(self, config):
+    def __init__(self, config, use_film=False):
         super().__init__()
+        location = config.film_location if use_film else None
+        self.film_attn_pre = FiLM(config) if location == 'attn_pre' else None
+        self.film_attn = FiLM(config) if location in ('attn', 'both') else None
+        self.film_mlp = FiLM(config) if location in ('mlp', 'both') else None
+        film_qkv = FiLM(config, out_dim=3 * config.n_embd) if location == 'qkv' else None
+
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, film_qkv=film_qkv)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
-        self.use_film = getattr(config, 'use_film', False)
-        self.film_location = getattr(config, 'film_location', 'both')
-        if self.film_location not in ('both', 'attn', 'attn_pre', 'qkv', 'mlp'):
-            raise ValueError(f"Unknown film_location: {self.film_location}")
-        if self.use_film:
-            self.film_attn = FiLMLayer(config)
-            self.film_mlp = FiLMLayer(config)
 
-    def forward(self, x, attn_mask, numeric_values=None, has_numeric=None):
+    def forward(self, x, attn_mask, values=None, value_mask=None):
+        film_on = values is not None
         attn_input = self.ln_1(x)
-        if self.use_film and numeric_values is not None and self.film_location == 'attn_pre':
-            attn_input = self.film_attn(attn_input, numeric_values, has_numeric)
-        y, att = self.attn(attn_input, attn_mask, numeric_values, has_numeric)
+        if film_on and self.film_attn_pre is not None:
+            attn_input = self.film_attn_pre(attn_input, values, value_mask)
+        y, att = self.attn(attn_input, attn_mask, values, value_mask)
         x = x + y
-        if self.use_film and numeric_values is not None and self.film_location in ('both', 'attn'):
-            x = self.film_attn(x, numeric_values, has_numeric)
+        if film_on and self.film_attn is not None:
+            x = self.film_attn(x, values, value_mask)
         x = x + self.mlp(self.ln_2(x))
-        if self.use_film and numeric_values is not None and self.film_location in ('both', 'mlp'):
-            x = self.film_mlp(x, numeric_values, has_numeric)
+        if film_on and self.film_mlp is not None:
+            x = self.film_mlp(x, values, value_mask)
         return x, att
 
 class AgeEncoding(nn.Module):
@@ -240,12 +255,23 @@ class DelphiConfig:
     t_min: float = 1.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     mask_ties: bool = False
-    use_film: bool = False  # allow FiLM layers for numeric value encoding
-    film_mode: str = 'both'  # 'both', 'gamma', or 'beta'
-    film_location: str = 'both'  # 'both', 'attn', 'attn_pre', 'qkv', or 'mlp'
-    film_context: str = 'hidden'  # 'hidden' or 'numeric'
-    film_scale: float = 0.1
+    use_film: bool = False  # condition lab tokens on their numeric values with FiLM
+    film_location: str = 'both'  # see Block: 'attn_pre', 'qkv', 'attn', 'mlp' or 'both'
+    film_layers: str = 'all'  # 'all' or comma-separated block indices, e.g. '0' or '0,1'
+    film_mode: str = 'both'  # 'both' (gamma and beta), 'gamma' (scale only) or 'beta' (shift only)
+    film_context: str = 'hidden'  # generator input: 'numeric' (value only) or 'hidden' (value + hidden state)
+    film_hidden_dim: int = 0  # generator width; 0 means n_embd
+    film_scale: float = 0.1  # bound on |gamma| and |beta|
     ignore_tokens: list = field(default_factory=lambda: [0])
+
+    def __post_init__(self):
+        if not self.use_film:
+            return
+        for name, allowed in (('film_location', FILM_LOCATIONS), ('film_mode', FILM_MODES),
+                              ('film_context', FILM_CONTEXTS)):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
+        parse_film_layers(self.film_layers, self.n_layer)
 
 class Delphi(nn.Module):
 
@@ -254,6 +280,7 @@ class Delphi(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        film_layers = parse_film_layers(config.film_layers, config.n_layer) if config.use_film else set()
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -263,7 +290,7 @@ class Delphi(nn.Module):
             #mlp = MLP(config),
             token_drop = nn.Dropout(config.token_dropout),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, use_film=i in film_layers) for i in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -280,20 +307,19 @@ class Delphi(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # Re-apply zero init to FiLM output layers — self.apply() above overwrites the
-        # zero-init done in FiLMLayer.__init__, breaking the identity-at-start property
-        if config.use_film:
-            for block in self.transformer.h:
-                nn.init.zeros_(block.film_attn.film_gen[-1].weight)
-                nn.init.zeros_(block.film_attn.film_gen[-1].bias)
-                nn.init.zeros_(block.film_mlp.film_gen[-1].weight)
-                nn.init.zeros_(block.film_mlp.film_gen[-1].bias)
-                if block.attn.film_qkv is not None:
-                    nn.init.zeros_(block.attn.film_qkv.film_gen[-1].weight)
-                    nn.init.zeros_(block.attn.film_qkv.film_gen[-1].bias)
+        # self.apply() above overwrote FiLM's zero init; restore it so FiLM starts as the identity
+        for module in self.modules():
+            if isinstance(module, FiLM):
+                module.reset_identity()
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        if config.use_film:
+            n_film = sum(1 for m in self.modules() if isinstance(m, FiLM))
+            print("FiLM: %d layers, %.3fM parameters" % (n_film, self.get_num_film_params()/1e6))
+
+    def get_num_film_params(self):
+        return sum(p.numel() for m in self.modules() if isinstance(m, FiLM) for p in m.parameters())
 
     def get_num_params(self, non_embedding=True):
         """
@@ -339,11 +365,12 @@ class Delphi(nn.Module):
 
         
         att = []
-        has_numeric = None
+        values, value_mask = None, None
         if numeric_values is not None and self.config.use_film:
-            has_numeric = (numeric_values[..., 0] != 0)  # raw value != 0 means has numeric
+            values = numeric_values
+            value_mask = numeric_values[..., 1] > 0  # channel 1 flags tokens that carry a value
         for block in self.transformer.h:
-            x, a = block(x, attn_mask, numeric_values, has_numeric)
+            x, a = block(x, attn_mask, values, value_mask)
             att.append(a)
         x = self.transformer.ln_f(x)
         att = torch.stack(att)
@@ -473,7 +500,7 @@ class Delphi(nn.Module):
         Selected parameters:
         --------------------
 
-        numeric_values: Tensor of shape (b, t, 2) or None — [raw_value, z_score] per token.
+        numeric_values: Tensor of shape (b, t, 2) or None — [z_score, has_value] per token.
         If provided, FiLM conditioning is applied during generation. Generated tokens
         receive zero values (no numeric modulation).
 

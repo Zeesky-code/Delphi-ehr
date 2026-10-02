@@ -24,7 +24,7 @@ n_head = 12
 n_embd = 120
 dropout = 0.0
 weight_decay = 2e-1
-vocab_size = 1281  # 1280 labels plus the reserved padding token
+vocab_size = 1280  # 1270 original labels (incl. padding) + 10 lab tokens
 
 learning_rate = 2e-3
 max_iters = 5000
@@ -34,8 +34,9 @@ beta2 = 0.99
 
 warmup_iters = 500
 
-# Ignore padding and lifestyle tokens (same as original)
-ignore_tokens = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+# Ignore padding, sex and lifestyle tokens (same as original) and the lab tokens (model ids
+# 1270-1279): labs are inputs only, so the model is never trained to predict or generate them
+ignore_tokens = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] + list(range(1270, 1280))
 t_min = 0.1
 token_dropout = 0.0
 no_event_token_rate = 5

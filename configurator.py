@@ -32,12 +32,16 @@ for arg in sys.argv[1:]:
         key, val = arg.split('=')
         key = key[2:]
         if key in globals():
-            try:
-                # attempt to eval it (e.g. if bool, number, or etc)
-                attempt = literal_eval(val)
-            except (SyntaxError, ValueError):
-                # if that goes wrong, just use the string
+            if isinstance(globals()[key], str):
+                # string settings keep the raw text, so e.g. --film_layers=0,1 isn't parsed as a tuple
                 attempt = val
+            else:
+                try:
+                    # attempt to eval it (e.g. if bool, number, or etc)
+                    attempt = literal_eval(val)
+                except (SyntaxError, ValueError):
+                    # if that goes wrong, just use the string
+                    attempt = val
             # ensure the types match ok
             assert type(attempt) == type(globals()[key])
             # cross fingers

@@ -51,7 +51,7 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
         a: input ages
         y: target tokens
         b: target ages
-        v: numeric values (B, T, 2) with [normalized_value, z_score] — only returned if values_data is not None
+        v: numeric values (B, T, 2) with [z_score, has_value] — only returned if values_data is not None
     """
 
     mask_time = -10000.
@@ -174,17 +174,20 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
     if has_values:
         v = v.masked_fill(x == 0, 0.0)
 
-    # normalize values
+    # normalize values; the second channel marks which tokens carry a value, since a lab
+    # result exactly at its mean has z = 0
     if has_values:
         z_scores = torch.zeros_like(v)
+        has_value = torch.zeros_like(v)
         if values_stats is not None:
             # x contains token IDs (already shifted by +1), so original token IDs are x-1
             for tok_id, (mean, std) in values_stats.items():
                 tok_mask = (x == tok_id + 1) & (v != 0)  # +1 because tokens are shifted
                 if tok_mask.any() and std > 0:
                     z_scores[tok_mask] = (v[tok_mask] - mean) / std
+                    has_value[tok_mask] = 1.0
         z_scores = torch.clamp(z_scores, -5.0, 5.0)
-        v = torch.stack([z_scores, z_scores], dim=-1)  # (B, T, 2)
+        v = torch.stack([z_scores, has_value], dim=-1)  # (B, T, 2)
 
     if device == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
