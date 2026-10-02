@@ -7,9 +7,10 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from model import Delphi, DelphiConfig
-from utils import get_p2i, get_batch
+from utils import get_p2i, get_batch, log_value_stats
 
 
 out_dir = 'out'
@@ -106,15 +107,8 @@ val_values_path = os.path.join(data_dir, 'val_values.bin')
 if use_film and os.path.exists(train_values_path):
     train_values = np.memmap(train_values_path, dtype=np.float32, mode='r')
     val_values = np.memmap(val_values_path, dtype=np.float32, mode='r')
-    # Compute per-token-type statistics for z-score normalization
-    values_stats = {}
-    has_value = train_values != 0
-    valued_tokens = train_data[has_value, 2]
-    valued_values = train_values[has_value]
-    for tok_id in np.unique(valued_tokens):
-        vals = valued_values[valued_tokens == tok_id]
-        if len(vals) > 100:  # need enough samples for stable stats
-            values_stats[int(tok_id)] = (float(vals.mean()), float(vals.std()))
+    # Per-token-type statistics for z-score normalization (saved in checkpoints for evaluation)
+    values_stats = log_value_stats(train_data, train_values)
     print(f"Loaded numeric values for {len(values_stats)} token types")
 else:
     train_values = None
@@ -122,6 +116,14 @@ else:
     values_stats = None
     if use_film:
         print("WARNING: use_film=True but no values files found, FiLM will act as identity")
+
+# Token ids of the diseases each lab group anticipates (written by data/generate_synthetic_labs.py),
+# for scoring the lab-linked diseases separately at the end of training
+linked_path = os.path.join(data_dir, 'lab_linked_tokens.json')
+lab_linked_groups = {}
+if os.path.exists(linked_path):
+    with open(linked_path) as f:
+        lab_linked_groups = json.load(f)['groups']
 
 train_p2i = get_p2i(train_data)
 val_p2i = get_p2i(val_data)
@@ -194,11 +196,15 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
 
-def fetch_batch(split, **kwargs):
-    """Sample a batch from a split. V (numeric values) is None unless FiLM values are loaded."""
+def fetch_batch(split, ix=None, **kwargs):
+    """
+    Get a batch from a split, of random patients unless ix gives the patient indices.
+    V (numeric values) is None unless FiLM values are loaded.
+    """
     data, p2i, values = {'train': (train_data, train_p2i, train_values),
                          'val': (val_data, val_p2i, val_values)}[split]
-    ix = torch.randint(len(p2i), (batch_size,))
+    if ix is None:
+        ix = torch.randint(len(p2i), (batch_size,))
     batch = get_batch(ix, data, p2i, block_size=block_size, device=device, select='left',
                       no_event_token_rate=no_event_token_rate,
                       values_data=values, values_stats=values_stats, **kwargs)
@@ -221,6 +227,50 @@ def estimate_loss():
             losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
         out[split] = losses.mean(0)
     model.train()
+    return out
+
+
+@torch.no_grad()
+def evaluate_full_val(eval_model):
+    """
+    Score every validation patient in a fixed order with regular "no event" padding, so all runs
+    are evaluated on identical inputs. Returns mean CE and dt losses over all scored targets, and
+    CE on targets that are lab-linked diseases, overall and per group (with target counts).
+    """
+    eval_model.eval()
+    ignored = torch.tensor(list(ignore_tokens) + [1], device=device)  # as validation_loss_mode
+    groups = {g: torch.tensor(t, device=device) for g, t in lab_linked_groups.items()}
+    if groups:
+        groups = {'linked': torch.unique(torch.cat(list(groups.values()))), **groups}
+    sums = {k: 0.0 for k in ['ce', 'dt', *groups]}
+    counts = {k: 0 for k in ['ce', *groups]}
+    for start in range(0, len(val_p2i), batch_size):
+        ix = torch.arange(start, min(start + batch_size, len(val_p2i)))
+        X, A, Y, B, V = fetch_batch('val', ix=ix, cut_batch=True)
+        with ctx:
+            logits, loss, _ = eval_model(X, A, Y, B, numeric_values=V, validation_loss_mode=True)
+        scored = ~torch.isin(Y, ignored)
+        n = int(scored.sum())
+        if n == 0:
+            continue
+        sums['ce'] += loss['loss_ce'].item() * n
+        sums['dt'] += loss['loss_dt'].item() * n
+        counts['ce'] += n
+        targets = Y[scored]
+        ce = F.cross_entropy(logits[scored].float(), targets, reduction='none')
+        for name, toks in groups.items():
+            m = torch.isin(targets, toks)
+            sums[name] += ce[m].sum().item()
+            counts[name] += int(m.sum())
+
+    out = {
+        'full_val_loss': (sums['ce'] + sums['dt']) / counts['ce'],
+        'full_val_ce': sums['ce'] / counts['ce'],
+        'full_val_dt': sums['dt'] / counts['ce'],
+    }
+    for name in groups:
+        out[f'full_val_ce_{name}'] = sums[name] / counts[name] if counts[name] else None
+        out[f'full_val_n_{name}'] = counts[name]
     return out
 
 
@@ -252,6 +302,7 @@ X, A, Y, B, V = fetch_batch('train', padding='random', lifestyle_augmentations=T
 t0 = time.time()
 iter_times = []
 last_val_losses = None
+best_val_losses = None  # [CE, dt] at the evaluation with the lowest total val loss
 local_iter_num = 0  # number of iterations in the lifetime of this process
 
 val_loss = None
@@ -285,12 +336,15 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': val_loss,
                     'config': config,
+                    'values_stats': values_stats,
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
 
         if best_val_loss > val_loss:
             best_val_loss = val_loss
+            best_val_losses = losses['val']
+            best_iter = iter_num
 
         if iter_num % 10_000 == 0:
             checkpoint = {
@@ -300,6 +354,7 @@ while True:
                 'iter_num': iter_num,
                 'best_val_loss': best_val_loss,
                 'config': config,
+                'values_stats': values_stats,
             }
             print(f"saving checkpoint to {out_dir}")
             torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
@@ -354,18 +409,31 @@ while True:
     if iter_num > max_iters:
         break
 
-# one-line record per run, for comparing variants (see scripts/compare_runs.py)
+# final evaluation of the best checkpoint on the whole validation set
 raw_model = unoptimized_model if compile else model
+best_ckpt = os.path.join(out_dir, 'ckpt.pt')
+if os.path.exists(best_ckpt):
+    state_dict = torch.load(best_ckpt, map_location=device, weights_only=False)['model']
+    raw_model.load_state_dict({k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()})
+full_val = evaluate_full_val(raw_model)
+print("full validation set (best checkpoint): " +
+      ", ".join(f"{k} {v:.4f}" for k, v in full_val.items() if isinstance(v, float)))
+
+# one-line record per run, for comparing variants (see scripts/compare_runs.py)
 summary = {
     'out_dir': out_dir,
     'seed': seed,
     'iters': iter_num - 1,
     'best_val_loss': best_val_loss if best_val_loss < 1e9 else None,
+    'best_iter': best_iter if best_val_losses is not None else None,
+    'best_val_loss_ce': best_val_losses[0].item() if best_val_losses is not None else None,
+    'best_val_loss_dt': best_val_losses[1].item() if best_val_losses is not None else None,
     'final_val_loss_ce': last_val_losses[0].item() if last_val_losses is not None else None,
     'final_val_loss_dt': last_val_losses[1].item() if last_val_losses is not None else None,
     'n_params': raw_model.get_num_params(),
     'n_film_params': raw_model.get_num_film_params(),
     'ms_per_iter': 1000 * float(np.median(iter_times)) if iter_times else None,
+    **full_val,
     **{k: model_args[k] for k in FILM_KEYS},
 }
 with open(os.path.join(out_dir, 'summary.json'), 'w') as f:

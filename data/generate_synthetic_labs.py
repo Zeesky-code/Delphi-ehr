@@ -5,8 +5,12 @@ This script:
 1. Loads the existing synthetic train/val data
 2. Defines 10 common lab test types as new tokens after the existing labels
 3. For each patient, simulates sparse clinic visits from age 40, each measuring a random subset of labs
-4. Correlates lab values with disease events where medically relevant
+4. Correlates lab values with disease events where medically relevant. Values start drifting in
+   the years BEFORE a diagnosis (and before death), so a lab value carries information about future
+   events that the token sequence alone does not.
 5. Saves extended data to a new directory: data/ukb_simulated_data_with_labs/
+6. Prints a signal check: how well each linked lab value separates measurements taken shortly
+   before a diagnosis from those in patients never diagnosed
 
 Token ids: the .bin files store raw ids, and get_batch() shifts every id by +1 so that 0 can be
 padding. Raw id k therefore corresponds to labels.csv entry k+1 (0-based). The original data uses
@@ -17,8 +21,10 @@ Output format:
   - train.bin / val.bin   : uint32 (patient_id, age_in_days, token_id) — same as original + new lab tokens
   - train_values.bin / val_values.bin : float32, one value per row (0.0 for non-lab tokens)
   - labels.csv            : extended label file with lab test names appended
+  - lab_linked_tokens.json : model token ids of the labs and of the diseases each lab group anticipates
 """
 
+import json
 import numpy as np
 import os
 import pickle
@@ -52,29 +58,41 @@ VISIT_MEAN_GAP_YEARS = 6.0
 # Raw token ids of the original data that are not diseases (no event, sex, lifestyle)
 FIRST_DISEASE_RAW_TOKEN = 12
 
-# Disease tokens that correlate with specific lab tests
-# Format: {disease_token_range: {lab_token: (value_shift_mean, value_shift_std)}}
-# These are approximate ICD-10 token ranges based on the label ordering
+# A patient's values for each lab sit at a personal baseline, offset from the population mean by
+# N(0, PATIENT_OFFSET_SD * lab std). This makes values vary between people for reasons unrelated
+# to disease, so an abnormal value is a noisy signal rather than a perfect one.
+PATIENT_OFFSET_SD = 0.5
+
+# Before a diagnosis the shift ramps up linearly over the group's lead_years, reaching
+# PRODROME_FRACTION of the full shift at diagnosis; it then reaches the full shift 2 years later.
+PRODROME_FRACTION = 0.5
+
+# Disease groups and the labs they move.
+# keywords: ICD-10 codes (exact) or text matched at word starts; labels: exact label matches
+# lead_years: how long before diagnosis the values start drifting
+# effects: {lab raw token: (full shift mean, full shift std)}
 DISEASE_LAB_CORRELATIONS = {
     # E10-E14 Diabetes → elevated HbA1c and Glucose
-    # Tokens roughly in range ~200-210 for metabolic diseases (Chapter IV)
-    "diabetes_keywords": {
+    "diabetes": {
         "keywords": ["diabetes", "E10", "E11", "E12", "E13", "E14"],
+        "lead_years": 5.0,
         "effects": {
             1269: (3.0, 1.5),   # HbA1c: +3% mean shift
             1270: (4.0, 2.0),   # Glucose: +4 mmol/L
         }
     },
     # I10-I15 Hypertension → elevated BP
-    "hypertension_keywords": {
+    "hypertension": {
         "keywords": ["hypertension", "hypertensive", "I10", "I11", "I12", "I13"],
+        "lead_years": 5.0,
         "effects": {
             1274: (25.0, 10.0),  # Systolic BP: +25 mmHg
         }
     },
     # E78 Hyperlipidemia → elevated cholesterol
-    "hyperlipidemia_keywords": {
+    "hyperlipidemia": {
         "keywords": ["hyperlipid", "cholesterol", "E78"],
+        "lead_years": 5.0,
         "effects": {
             1271: (2.0, 0.8),   # Total cholesterol: +2
             1273: (1.5, 0.6),   # LDL: +1.5
@@ -82,31 +100,45 @@ DISEASE_LAB_CORRELATIONS = {
         }
     },
     # Liver diseases → elevated ALT
-    "liver_keywords": {
+    "liver": {
         "keywords": ["liver", "hepat", "K70", "K71", "K72", "K73", "K74", "K75", "K76"],
+        "lead_years": 3.0,
         "effects": {
             1276: (50.0, 30.0),  # ALT: +50
         }
     },
     # Kidney diseases → elevated creatinine
-    "kidney_keywords": {
+    "kidney": {
         "keywords": ["renal failure", "kidney disease", "N17", "N18", "N19"],
+        "lead_years": 3.0,
         "effects": {
             1275: (100.0, 50.0),  # Creatinine: +100
         }
     },
     # Anaemia → low hemoglobin
-    "anaemia_keywords": {
+    "anaemia": {
         "keywords": ["anaemia", "anemia", "D50", "D51", "D52", "D53"],
+        "lead_years": 2.0,
         "effects": {
             1277: (-3.0, 1.0),  # Hemoglobin: -3
         }
     },
     # Inflammatory conditions → elevated CRP
-    "inflammation_keywords": {
+    "inflammation": {
         "keywords": ["arthritis", "inflammatory", "crohn", "colitis", "M05", "M06", "K50", "K51"],
+        "lead_years": 1.0,
         "effects": {
             1278: (20.0, 15.0),  # CRP: +20
+        }
+    },
+    # Declining health before death → lower haemoglobin, higher CRP and creatinine
+    "death": {
+        "labels": ["Death"],
+        "lead_years": 3.0,
+        "effects": {
+            1277: (-1.5, 0.8),   # Hemoglobin: -1.5
+            1278: (8.0, 6.0),    # CRP: +8
+            1275: (25.0, 15.0),  # Creatinine: +25
         }
     },
 }
@@ -118,9 +150,9 @@ def load_labels(labels_path):
         return [line.strip() for line in f.readlines()]
 
 
-def find_disease_tokens(labels, keywords):
+def find_disease_tokens(labels, keywords=(), exact_labels=()):
     """
-    Find raw token IDs whose labels match any of the keywords.
+    Find raw token IDs whose labels match any of the keywords or exact labels.
 
     ICD-10 code keywords (e.g. "E11") must equal the label's code; text keywords match the
     start of a word, case-insensitive (so "renal" does not match "adrenal").
@@ -130,6 +162,9 @@ def find_disease_tokens(labels, keywords):
     for idx, label in enumerate(labels):
         raw_token = idx - 1  # labels.csv entry k is raw token k-1 (get_batch shifts by +1)
         if raw_token < FIRST_DISEASE_RAW_TOKEN:
+            continue
+        if label in exact_labels:
+            matching.add(raw_token)
             continue
         code = label.split()[0] if label else ""
         for kw in keywords:
@@ -143,15 +178,23 @@ def find_disease_tokens(labels, keywords):
     return matching
 
 
+def find_group_tokens(labels):
+    """Map each correlation group to the raw token ids of its diseases."""
+    return {
+        group: find_disease_tokens(labels, info.get("keywords", ()), info.get("labels", ()))
+        for group, info in DISEASE_LAB_CORRELATIONS.items()
+    }
+
+
 def build_correlation_map(labels, lab_token_offset=0):
     """
-    Build a mapping: disease_token_id → {lab_token_id: (shift_mean, shift_std)}.
+    Build a mapping: disease_token_id → {lab_token_id: (shift_mean, shift_std, lead_years)}.
     """
     corr_map = {}
-    for group_name, group_info in DISEASE_LAB_CORRELATIONS.items():
-        matching_tokens = find_disease_tokens(labels, group_info["keywords"])
+    for group_name, matching_tokens in find_group_tokens(labels).items():
+        group_info = DISEASE_LAB_CORRELATIONS[group_name]
         remapped_effects = {
-            lab_token + lab_token_offset: effect
+            lab_token + lab_token_offset: (*effect, group_info["lead_years"])
             for lab_token, effect in group_info["effects"].items()
         }
         for tok in matching_tokens:
@@ -181,11 +224,17 @@ def generate_labs_for_patient(patient_data, corr_map, rng, lab_tests=LAB_TESTS):
     min_age = ages.min()
     max_age = ages.max()
 
-    # Find which diseases this patient has and when
+    # Find which diseases this patient has and when they were first recorded
     patient_diseases = {}
     for age, tok in zip(ages, tokens):
         if tok >= FIRST_DISEASE_RAW_TOKEN:  # Skip no event, sex, lifestyle tokens
-            patient_diseases[tok] = age
+            patient_diseases.setdefault(tok, age)
+
+    # Personal baseline per lab
+    patient_offsets = {
+        lab_token: rng.normal(0, PATIENT_OFFSET_SD * definition[3])
+        for lab_token, definition in lab_tests.items()
+    }
 
     lab_events = []
     lab_values = []
@@ -203,8 +252,8 @@ def generate_labs_for_patient(patient_data, corr_map, rng, lab_tests=LAB_TESTS):
             if rng.random() >= p_measure:
                 continue
 
-            # Base value: normal distribution
-            value = rng.normal(mean, std)
+            # Base value: normal distribution around the patient's personal baseline
+            value = rng.normal(mean, std) + patient_offsets[lab_token]
 
             # Age-related drift (many lab values trend upward with age)
             age_years = m_age / 365.25
@@ -215,16 +264,19 @@ def generate_labs_for_patient(patient_data, corr_map, rng, lab_tests=LAB_TESTS):
             elif name == "Creatinine":  # Creatinine trends up
                 value += (age_years - 50) * 0.5
 
-            # Disease correlations: if patient has a correlated disease
-            # diagnosed BEFORE this measurement, shift the value
+            # Disease correlations: shift the value in the lead-up to a correlated diagnosis
+            # (or death) and after it
             for disease_tok, disease_age in patient_diseases.items():
                 if disease_tok in corr_map and lab_token in corr_map[disease_tok]:
-                    if disease_age <= m_age:
-                        shift_mean, shift_std = corr_map[disease_tok][lab_token]
-                        # Shift increases over time after diagnosis (up to full shift at 2 years)
-                        time_since = (m_age - disease_age) / 365.25
-                        ramp = min(1.0, time_since / 2.0)
-                        value += rng.normal(shift_mean * ramp, shift_std * 0.5)
+                    shift_mean, shift_std, lead_years = corr_map[disease_tok][lab_token]
+                    years_after = (m_age - disease_age) / 365.25
+                    if years_after >= 0:
+                        ramp = PRODROME_FRACTION + (1 - PRODROME_FRACTION) * min(1.0, years_after / 2.0)
+                    elif -years_after < lead_years:
+                        ramp = PRODROME_FRACTION * (1 + years_after / lead_years)
+                    else:
+                        continue
+                    value += rng.normal(shift_mean * ramp, shift_std * 0.5 * ramp)
 
             # Clamp to realistic range
             value = np.clip(value, min_v, max_v)
@@ -287,6 +339,46 @@ def process_dataset(data, corr_map, rng, lab_tests=LAB_TESTS):
     return extended_data, values
 
 
+def rank_auc(pos, neg):
+    """Probability that a random positive scores above a random negative (Mann-Whitney AUC)."""
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    scores = np.concatenate([pos, neg])
+    ranks = scores.argsort().argsort() + 1
+    return (ranks[:len(pos)].sum() - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg))
+
+
+def lead_signal_report(data, values, group_tokens, lab_token_offset, lab_names):
+    """
+    For each group and linked lab, compare measurements taken within the lead window before the
+    patient's first diagnosis (positives) against measurements from never-diagnosed patients
+    (negatives). AUC 0.5 means the value carries no warning; it is oriented by the shift's sign.
+    """
+    starts = np.r_[0, np.flatnonzero(np.diff(data[:, 0].astype(np.int64))) + 1, len(data)]
+    print(f"\n  {'group':15s} {'lab':18s} {'lead':>5s} {'n_pos':>6s} {'n_neg':>7s} {'AUC':>5s}")
+    for group, info in DISEASE_LAB_CORRELATIONS.items():
+        tokens = np.array(sorted(group_tokens[group]))
+        for lab, (shift_mean, _) in info["effects"].items():
+            lab_tok = lab + lab_token_offset
+            lead_days = info["lead_years"] * 365.25
+            pos, neg = [], []
+            for a, b in zip(starts[:-1], starts[1:]):
+                tok, age, val = data[a:b, 2], data[a:b, 1].astype(np.float64), values[a:b]
+                is_lab = tok == lab_tok
+                if not is_lab.any():
+                    continue
+                dx = np.isin(tok, tokens)
+                if not dx.any():
+                    neg.extend(val[is_lab])
+                else:
+                    gap = age[dx].min() - age[is_lab]
+                    pos.extend(val[is_lab][(gap > 0) & (gap <= lead_days)])
+            sign = 1 if shift_mean > 0 else -1
+            auc = rank_auc(sign * np.array(pos), sign * np.array(neg))
+            print(f"  {group:15s} {lab_names[lab_tok]:18s} {info['lead_years']:4.0f}y "
+                  f"{len(pos):6d} {len(neg):7d} {auc:5.2f}")
+
+
 def main():
     src_dir = Path(__file__).parent / "ukb_simulated_data"
     dst_dir = Path(__file__).parent / "ukb_simulated_data_with_labs"
@@ -303,7 +395,15 @@ def main():
         for lab_token, definition in LAB_TESTS.items()
     }
     corr_map = build_correlation_map(labels, lab_token_offset)
+    group_tokens = find_group_tokens(labels)
     print(f"Found disease-lab correlations for {len(corr_map)} disease tokens")
+
+    # Model token ids (raw + 1) of the labs and of each group's diseases, for targeted evaluation
+    with open(dst_dir / "lab_linked_tokens.json", "w") as f:
+        json.dump({
+            "lab_tokens": sorted(int(t) + 1 for t in lab_tests),
+            "groups": {g: sorted(int(t) + 1 for t in toks) for g, toks in group_tokens.items()},
+        }, f, indent=1)
 
     # Extend labels with lab test names
     extended_labels = labels.copy()
@@ -337,6 +437,10 @@ def main():
         n_orig = np.sum(~is_lab)
         print(f"  Original tokens: {n_orig}, Lab tokens: {n_lab} ({n_lab / len(extended_data):.0%} of rows)")
         print(f"  Avg lab events/patient: {n_lab / len(np.unique(extended_data[:, 0])):.1f}")
+        if split == "train":
+            print("  Signal check (lab value before first diagnosis vs never diagnosed):")
+            lab_names = {t: d[0] for t, d in lab_tests.items()}
+            lead_signal_report(extended_data, values, group_tokens, lab_token_offset, lab_names)
 
     # meta.pkl: same structure as the original, extended to the new vocabulary
     with open(src_dir / "meta.pkl", "rb") as f:
@@ -373,6 +477,7 @@ def main():
     print(f"  {dst_dir}/val.bin            — extended token data")
     print(f"  {dst_dir}/val_values.bin     — parallel numeric values")
     print(f"  {dst_dir}/labels.csv         — extended label file")
+    print(f"  {dst_dir}/lab_linked_tokens.json — lab and lab-linked disease token ids")
 
 
 if __name__ == "__main__":

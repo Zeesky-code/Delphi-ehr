@@ -4,6 +4,7 @@ from tqdm.autonotebook import tqdm
 import pandas as pd
 import numpy as np
 import argparse
+import json
 from utils import get_batch, get_p2i
 from pathlib import Path
 
@@ -428,8 +429,10 @@ def main():
     parser.add_argument("--output_path", type=str, help="Path to the output")
     parser.add_argument("--model_ckpt_path", type=str, help="Path to the model weights")
     parser.add_argument("--no_event_token_rate", type=int, help="No event token rate")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to run the model on")
     parser.add_argument(
-        "--health_token_replacement_prob", default=0.0, type=float, help="Health token replacement probability"
+        "--diseases", choices=["common", "lab_linked"], default="common",
+        help="common: all common diseases; lab_linked: only diseases in <input_path>/lab_linked_tokens.json",
     )
     parser.add_argument("--dataset_subset_size", type=int, default=-1, help="Dataset subset size for evaluation")
     parser.add_argument("--n_bootstrap", type=int, default=1, help="Number of bootstrap samples")
@@ -441,18 +444,17 @@ def main():
     input_path = args.input_path
     output_path = args.output_path
     no_event_token_rate = args.no_event_token_rate
-    health_token_replacement_prob = args.health_token_replacement_prob
     dataset_subset_size = args.dataset_subset_size
 
     # Create output folder if it doesn't exist.
     Path(output_path).mkdir(exist_ok=True, parents=True)
 
-    device = "cuda"
+    device = args.device
     seed = 1337
 
     # Load model checkpoint and initialize model.
     ckpt_path = args.model_ckpt_path
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     conf = DelphiConfig(**checkpoint["model_args"])
     model = Delphi(conf)
     state_dict = checkpoint["model"]
@@ -468,6 +470,12 @@ def main():
     if dataset_subset_size == -1:
         dataset_subset_size = len(val_p2i)
 
+    # FiLM models get their lab values, normalised with the statistics saved at training time
+    values_stats = checkpoint.get("values_stats")
+    val_values = None
+    if conf.use_film and values_stats is not None:
+        val_values = np.fromfile(f"{input_path}/val_values.bin", dtype=np.float32)
+
     # Get a subset batch for evaluation.
     d100k = get_batch(
         range(dataset_subset_size),
@@ -478,8 +486,15 @@ def main():
         device=device,
         padding="random",
         no_event_token_rate=no_event_token_rate,
-        health_token_replacement_prob=health_token_replacement_prob,
+        values_data=val_values,
+        values_stats=values_stats,
     )
+
+    diseases_of_interest = None
+    if args.diseases == "lab_linked":
+        with open(f"{input_path}/lab_linked_tokens.json") as f:
+            linked = json.load(f)["groups"]
+        diseases_of_interest = sorted({t for tokens in linked.values() for t in tokens})
 
     # Load labels (external) to be passed in.
     delphi_labels = pd.read_csv("delphi_labels_chapters_colours_icd.csv")
@@ -490,7 +505,7 @@ def main():
         d100k,
         output_path,
         delphi_labels,
-        diseases_of_interest=None,
+        diseases_of_interest=diseases_of_interest,
         filter_min_total=args.filter_min_total,
         disease_chunk_size=args.disease_chunk_size,
         device=device,

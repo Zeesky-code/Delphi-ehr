@@ -27,8 +27,8 @@ weight_decay = 2e-1
 vocab_size = 1280  # 1270 original labels (incl. padding) + 10 lab tokens
 
 learning_rate = 2e-3
-max_iters = 5000
-lr_decay_iters = 5000
+max_iters = 3000  # runs overfit after ~2000-2500 iterations on the synthetic data
+lr_decay_iters = 3000
 min_lr = 2e-4
 beta2 = 0.99
 

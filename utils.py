@@ -23,6 +23,23 @@ def get_p2i(data):
     return np.array(p2i)
 
 
+def log_value_stats(data, values, min_count=100):
+    """
+    Per-token (mean, std) of log(value) over rows that carry a value (value > 0), for get_batch's
+    z-scoring. Token ids are raw (before get_batch's +1 shift). Tokens with fewer than min_count
+    values are left out and get z = 0.
+    """
+    has_value = values > 0
+    tokens = data[has_value, 2]
+    logs = np.log(values[has_value].astype(np.float64))
+    stats = {}
+    for tok_id in np.unique(tokens):
+        vals = logs[tokens == tok_id]
+        if len(vals) > min_count:
+            stats[int(tok_id)] = (float(vals.mean()), float(vals.std()))
+    return stats
+
+
 def get_batch(ix, data, p2i, select='random', index='patient', padding='regular',
               block_size=48, device='cpu', lifestyle_augmentations=False, 
               no_event_token_rate=5, cut_batch=False,
@@ -44,7 +61,7 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
         no_event_token_rate: average rate of "no event" tokens in years
         cut_batch: whether to cut the batch to the smallest size possible
         values_data: numpy array of float32 numeric values parallel to data (one value per row), or None
-        values_stats: dict of {token_id: (mean, std)} for z-score computation, or None
+        values_stats: dict of {token_id: (mean, std)} of log values (see log_value_stats), or None
 
     Returns:
         x: input tokens
@@ -174,8 +191,9 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
     if has_values:
         v = v.masked_fill(x == 0, 0.0)
 
-    # normalize values; the second channel marks which tokens carry a value, since a lab
-    # result exactly at its mean has z = 0
+    # normalize values as z-scores of log(value) per token type, since lab values are positive and
+    # often skewed (CRP, ALT, creatinine); the second channel marks which tokens carry a value,
+    # since a lab result exactly at its mean has z = 0
     if has_values:
         z_scores = torch.zeros_like(v)
         has_value = torch.zeros_like(v)
@@ -184,7 +202,7 @@ def get_batch(ix, data, p2i, select='random', index='patient', padding='regular'
             for tok_id, (mean, std) in values_stats.items():
                 tok_mask = (x == tok_id + 1) & (v != 0)  # +1 because tokens are shifted
                 if tok_mask.any() and std > 0:
-                    z_scores[tok_mask] = (v[tok_mask] - mean) / std
+                    z_scores[tok_mask] = (torch.log(v[tok_mask]) - mean) / std
                     has_value[tok_mask] = 1.0
         z_scores = torch.clamp(z_scores, -5.0, 5.0)
         v = torch.stack([z_scores, has_value], dim=-1)  # (B, T, 2)
