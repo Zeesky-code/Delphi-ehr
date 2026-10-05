@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import argparse
 import json
-from utils import get_batch, get_p2i
+from utils import get_batch, get_p2i, shuffle_values_within_tokens
 from pathlib import Path
 
 
@@ -430,6 +430,7 @@ def main():
     parser.add_argument("--model_ckpt_path", type=str, help="Path to the model weights")
     parser.add_argument("--no_event_token_rate", type=int, help="No event token rate")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run the model on")
+    parser.add_argument("--block_size", type=int, default=None, help="Context length (default: the model's)")
     parser.add_argument(
         "--diseases", choices=["common", "lab_linked"], default="common",
         help="common: all common diseases; lab_linked: only diseases in <input_path>/lab_linked_tokens.json",
@@ -475,6 +476,8 @@ def main():
     val_values = None
     if conf.use_film and values_stats is not None:
         val_values = np.fromfile(f"{input_path}/val_values.bin", dtype=np.float32)
+        if checkpoint.get("config", {}).get("film_shuffle_values"):
+            val_values = shuffle_values_within_tokens(val, val_values)  # same control as in training
 
     # Get a subset batch for evaluation.
     d100k = get_batch(
@@ -482,7 +485,7 @@ def main():
         val,
         val_p2i,
         select="left",
-        block_size=80,
+        block_size=args.block_size or conf.block_size,
         device=device,
         padding="random",
         no_event_token_rate=no_event_token_rate,

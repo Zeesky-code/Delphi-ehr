@@ -1,0 +1,12 @@
+# MIMIC-IV data must not be shared (PhysioNet data use agreement): never commit derived data
+data/mimic4_labs/
+mimic_scoping/
+
+# training outputs
+runs/
+Delphi-*/
+
+# Python and OS clutter
+__pycache__/
+*.pyc
+.DS_Store

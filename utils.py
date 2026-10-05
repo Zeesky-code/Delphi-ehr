@@ -40,6 +40,22 @@ def log_value_stats(data, values, min_count=100):
     return stats
 
 
+def shuffle_values_within_tokens(data, values, seed=0):
+    """
+    Control for FiLM: permute values among all rows of the same token, so each lab keeps its value
+    distribution but values no longer belong to their patients or times. The seed is fixed so
+    training and evaluation see the same permutation.
+    """
+    out = np.array(values, dtype=np.float32, copy=True)
+    has_value = np.flatnonzero(out > 0)
+    tokens = data[has_value, 2]
+    rng = np.random.default_rng(seed)
+    for tok_id in np.unique(tokens):
+        rows = has_value[tokens == tok_id]
+        out[rows] = out[rng.permutation(rows)]
+    return out
+
+
 def get_batch(ix, data, p2i, select='random', index='patient', padding='regular',
               block_size=48, device='cpu', lifestyle_augmentations=False, 
               no_event_token_rate=5, cut_batch=False,

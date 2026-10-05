@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from model import Delphi, DelphiConfig
-from utils import get_p2i, get_batch, log_value_stats
+from utils import get_p2i, get_batch, log_value_stats, shuffle_values_within_tokens
 
 
 out_dir = 'out'
@@ -72,6 +72,7 @@ film_mode = 'both'
 film_context = 'hidden'
 film_hidden_dim = 0
 film_scale = 0.1
+film_shuffle_values = False  # control: permute each lab's values across patients (see utils)
 ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
@@ -107,6 +108,10 @@ val_values_path = os.path.join(data_dir, 'val_values.bin')
 if use_film and os.path.exists(train_values_path):
     train_values = np.memmap(train_values_path, dtype=np.float32, mode='r')
     val_values = np.memmap(val_values_path, dtype=np.float32, mode='r')
+    if film_shuffle_values:
+        print("film_shuffle_values: lab values are permuted across patients (control run)")
+        train_values = shuffle_values_within_tokens(train_data, train_values)
+        val_values = shuffle_values_within_tokens(val_data, val_values)
     # Per-token-type statistics for z-score normalization (saved in checkpoints for evaluation)
     values_stats = log_value_stats(train_data, train_values)
     print(f"Loaded numeric values for {len(values_stats)} token types")
@@ -435,6 +440,7 @@ summary = {
     'ms_per_iter': 1000 * float(np.median(iter_times)) if iter_times else None,
     **full_val,
     **{k: model_args[k] for k in FILM_KEYS},
+    'film_shuffle_values': film_shuffle_values,
 }
 with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
     json.dump(summary, f, indent=2)

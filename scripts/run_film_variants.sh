@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train the FiLM variants on the synthetic lab data, one output folder per variant and seed:
+# Train the FiLM variants, one output folder per variant and seed:
 #   $RUNS_DIR/<variant>/seed<seed>/  (ckpt.pt, train.log, summary.json)
 #
 # Usage:
@@ -11,24 +11,30 @@
 # With wandb on, each run is named <variant>-seed<seed> and grouped by variant, so seeds average together.
 #
 # Environment:
+#   DATA=mimic4        dataset: mimic4 (default; build it with data/mimic/build_mimic4.py) or synthetic
 #   SEEDS="42 43 44"   seeds to run (default 42); use several before trusting small differences
 #   ANCHOR=qkv         film_location for the mode/context/layer/width sweeps (default both)
-#   RUNS_DIR=runs/film output root
+#   RUNS_DIR=...       output root (default runs/film-<DATA>)
 #   PYTHON=python3     interpreter to use
 #
-# Compare finished runs with: python3 scripts/compare_runs.py runs/film
+# Compare finished runs with: python3 scripts/compare_runs.py runs/film-mimic4
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-RUNS_DIR=${RUNS_DIR:-runs/film}
+DATA=${DATA:-mimic4}
+RUNS_DIR=${RUNS_DIR:-runs/film-$DATA}
 SEEDS=${SEEDS:-42}
 ANCHOR=${ANCHOR:-both}
 PYTHON=${PYTHON:-python3}
-FILM=config/train_delphi_film.py
+case "$DATA" in
+    mimic4)    FILM=config/train_delphi_mimic4_film.py;  BASELINE=config/train_delphi_mimic4_baseline.py ;;
+    synthetic) FILM=config/train_delphi_film.py;         BASELINE=config/train_delphi_labs_baseline.py ;;
+    *) echo "DATA must be mimic4 or synthetic" >&2; exit 1 ;;
+esac
 
 # name  config  overrides
 VARIANTS="
-baseline        config/train_delphi_labs_baseline.py
+baseline        $BASELINE
 attn_pre        $FILM --film_location=attn_pre
 qkv             $FILM --film_location=qkv
 attn            $FILM --film_location=attn
@@ -40,6 +46,8 @@ ${ANCHOR}_numeric   $FILM --film_location=$ANCHOR --film_context=numeric
 ${ANCHOR}_layer0    $FILM --film_location=$ANCHOR --film_layers=0
 ${ANCHOR}_layers01  $FILM --film_location=$ANCHOR --film_layers=0,1
 ${ANCHOR}_h32       $FILM --film_location=$ANCHOR --film_hidden_dim=32
+qkv_shuffled            $FILM --film_location=qkv --film_shuffle_values=True
+${ANCHOR}_numeric_shuffled  $FILM --film_location=$ANCHOR --film_context=numeric --film_shuffle_values=True
 "
 
 selected=()
