@@ -341,7 +341,10 @@ class Delphi(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, age, targets=None, targets_age=None, numeric_values=None, validation_loss_mode=False):
+    def forward(self, idx, age, targets=None, targets_age=None, numeric_values=None, validation_loss_mode=False,
+                return_attention=True):
+        # return_attention=False skips stacking every layer's (B, heads, T, T) attention map into one
+        # tensor; training doesn't use it, and at long block sizes it costs gigabytes of GPU memory
         device = idx.device
         b, t = idx.size()
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -371,9 +374,10 @@ class Delphi(nn.Module):
             value_mask = numeric_values[..., 1] > 0  # channel 1 flags tokens that carry a value
         for block in self.transformer.h:
             x, a = block(x, attn_mask, values, value_mask)
-            att.append(a)
+            if return_attention:
+                att.append(a)
         x = self.transformer.ln_f(x)
-        att = torch.stack(att)
+        att = torch.stack(att) if return_attention else None
 
         if targets is not None:
             # next token cross entropy loss, padding masked

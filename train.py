@@ -228,7 +228,8 @@ def estimate_loss():
         for k in range(eval_iters):
             X, A, Y, B, V = fetch_batch(split, cut_batch=True)
             with ctx:
-                logits, loss, _ = model(X, A, Y, B, numeric_values=V, validation_loss_mode=True)
+                logits, loss, _ = model(X, A, Y, B, numeric_values=V, validation_loss_mode=True,
+                                        return_attention=False)
             losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
         out[split] = losses.mean(0)
     model.train()
@@ -253,7 +254,8 @@ def evaluate_full_val(eval_model):
         ix = torch.arange(start, min(start + batch_size, len(val_p2i)))
         X, A, Y, B, V = fetch_batch('val', ix=ix, cut_batch=True)
         with ctx:
-            logits, loss, _ = eval_model(X, A, Y, B, numeric_values=V, validation_loss_mode=True)
+            logits, loss, _ = eval_model(X, A, Y, B, numeric_values=V, validation_loss_mode=True,
+                                         return_attention=False)
         scored = ~torch.isin(Y, ignored)
         n = int(scored.sum())
         if n == 0:
@@ -371,14 +373,16 @@ while True:
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         with ctx:
-            logits, loss, att = model(X, A, Y, B, numeric_values=V)
+            logits, loss, _ = model(X, A, Y, B, numeric_values=V, return_attention=False)
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, A, Y, B, V = fetch_batch('train', padding='random', lifestyle_augmentations=True,
                                     cut_batch=True)
 
-        # backward pass, with gradient scaling if training in fp16
+        # backward pass, with gradient scaling if training in fp16. Dividing by the number of
+        # micro-steps makes the accumulated gradient the mean over the full batch, as with one
+        # big batch (otherwise gradient clipping sees a gradient that many times larger)
         loss = loss['loss_ce'] + loss['loss_dt']
-        scaler.scale(loss).backward()
+        scaler.scale(loss / gradient_accumulation_steps).backward()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)

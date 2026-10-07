@@ -14,8 +14,11 @@ wandb_project = 'delphi-mimic4'
 wandb_run_name = 'mimic4-film-' + str(time.time())
 
 dataset = 'mimic4_labs'
-batch_size = 128
-block_size = 256  # hospital records are longer than UK Biobank's; check the build's length report
+# Effective batch 128 as two micro-batches of 64: at block_size 256 the attention maps of a
+# single batch of 128 need ~18 GB of GPU memory, more than a T4 has (~9 GB at 64)
+batch_size = 64
+gradient_accumulation_steps = 2
+block_size = 256  # hospital records are longer than UK Biobank's; 3.5% of patients exceed 256
 data_fraction = 1.0
 
 # Same architecture as the synthetic runs
@@ -26,7 +29,7 @@ dropout = 0.0
 weight_decay = 2e-1
 vocab_size = 1287  # Delphi's 1270 labels + 17 valued tokens (15 labs, BMI, systolic BP)
 
-# ~180k training patients: 10k iterations of 128 is about 7 passes over the data
+# ~98k training patients: 10k iterations of 128 is about 13 passes over the data
 learning_rate = 2e-3
 max_iters = 10000
 lr_decay_iters = 10000
