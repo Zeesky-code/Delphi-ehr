@@ -29,6 +29,7 @@ RUNS_DIR=${RUNS_DIR:-runs/film-$DATA}
 SEEDS=${SEEDS:-42}
 ANCHOR=${ANCHOR:-both}
 PYTHON=${PYTHON:-python3}
+export PYTHONUNBUFFERED=1  
 case "$DATA" in
     mimic4)    FILM=config/train_delphi_mimic4_film.py;  BASELINE=config/train_delphi_mimic4_baseline.py ;;
     synthetic) FILM=config/train_delphi_film.py;         BASELINE=config/train_delphi_labs_baseline.py ;;
