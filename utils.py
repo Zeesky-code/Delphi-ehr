@@ -56,6 +56,59 @@ def shuffle_values_within_tokens(data, values, seed=0):
     return out
 
 
+@torch.no_grad()
+def evaluate_split(model, data, p2i, values, values_stats, lab_linked_groups, ignore_tokens,
+                   block_size, batch_size, device, no_event_token_rate=5, ctx=None):
+    """
+    Score every patient of a split in a fixed order with regular "no event" padding, so all runs
+    are evaluated on identical inputs. Returns mean CE and dt losses over all scored targets, and
+    CE on targets that are lab-linked diseases, overall and per group (with target counts).
+    lab_linked_groups maps group name -> model token ids (as in lab_linked_tokens.json).
+    """
+    import torch.nn.functional as F
+    from contextlib import nullcontext
+    ctx = ctx or nullcontext()
+    model.eval()
+    ignored = torch.tensor(list(ignore_tokens) + [1], device=device)  # as validation_loss_mode
+    groups = {g: torch.tensor(t, device=device) for g, t in lab_linked_groups.items()}
+    if groups:
+        groups = {'linked': torch.unique(torch.cat(list(groups.values()))), **groups}
+    sums = {k: 0.0 for k in ['ce', 'dt', *groups]}
+    counts = {k: 0 for k in ['ce', *groups]}
+    for start in range(0, len(p2i), batch_size):
+        ix = torch.arange(start, min(start + batch_size, len(p2i)))
+        batch = get_batch(ix, data, p2i, block_size=block_size, device=device, select='left',
+                          no_event_token_rate=no_event_token_rate, cut_batch=True,
+                          values_data=values, values_stats=values_stats)
+        X, A, Y, B, V = batch if values is not None else (*batch, None)
+        with ctx:
+            logits, loss, _ = model(X, A, Y, B, numeric_values=V, validation_loss_mode=True,
+                                    return_attention=False)
+        scored = ~torch.isin(Y, ignored)
+        n = int(scored.sum())
+        if n == 0:
+            continue
+        sums['ce'] += loss['loss_ce'].item() * n
+        sums['dt'] += loss['loss_dt'].item() * n
+        counts['ce'] += n
+        targets = Y[scored]
+        ce = F.cross_entropy(logits[scored].float(), targets, reduction='none')
+        for name, toks in groups.items():
+            m = torch.isin(targets, toks)
+            sums[name] += ce[m].sum().item()
+            counts[name] += int(m.sum())
+
+    out = {
+        'loss': (sums['ce'] + sums['dt']) / counts['ce'],
+        'ce': sums['ce'] / counts['ce'],
+        'dt': sums['dt'] / counts['ce'],
+    }
+    for name in groups:
+        out[f'ce_{name}'] = sums[name] / counts[name] if counts[name] else None
+        out[f'n_{name}'] = counts[name]
+    return out
+
+
 def get_batch(ix, data, p2i, select='random', index='patient', padding='regular',
               block_size=48, device='cpu', lifestyle_augmentations=False, 
               no_event_token_rate=5, cut_batch=False,

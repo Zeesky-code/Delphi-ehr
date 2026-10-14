@@ -7,10 +7,9 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from model import Delphi, DelphiConfig
-from utils import get_p2i, get_batch, log_value_stats, shuffle_values_within_tokens
+from utils import get_p2i, get_batch, log_value_stats, shuffle_values_within_tokens, evaluate_split
 
 
 out_dir = 'out'
@@ -18,7 +17,8 @@ eval_interval = 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = False  # if True, always save a checkpoint after each eval
+always_save_checkpoint = False  # unused: ckpt_last.pt is now written at every eval
+checkpoint_rule = 'final'  # checkpoint scored at the end: 'final' (fixed budget, the default) or 'best' val loss
 init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
 seed = 42
 
@@ -140,6 +140,7 @@ if data_fraction < 1.0:
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+best_iter = None
 
 
 print(f"found vocab_size = {vocab_size}")
@@ -163,7 +164,11 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    # ckpt_last.pt is written at every eval; older runs only have ckpt.pt (their best checkpoint)
+    ckpt_path = os.path.join(out_dir, 'ckpt_last.pt')
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    print(f"resuming from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -184,6 +189,7 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    best_iter = checkpoint.get('best_iter', iter_num)
 
 model.to(device)
 
@@ -216,7 +222,11 @@ def fetch_batch(split, ix=None, **kwargs):
     return batch if values is not None else (*batch, None)
 
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
+# The patients behind each periodic loss estimate are drawn once, with a fixed generator, so every
+# eval of every run (any variant, any seed) scores the same patients and the curves are comparable
+_eval_gen = torch.Generator().manual_seed(1234)
+eval_ix = {split: torch.randint(len(p2i), (eval_iters, batch_size), generator=_eval_gen)
+           for split, p2i in [('train', train_p2i), ('val', val_p2i)]}
 
 
 @torch.no_grad()
@@ -226,7 +236,7 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters, 2)
         for k in range(eval_iters):
-            X, A, Y, B, V = fetch_batch(split, cut_batch=True)
+            X, A, Y, B, V = fetch_batch(split, ix=eval_ix[split][k], cut_batch=True)
             with ctx:
                 logits, loss, _ = model(X, A, Y, B, numeric_values=V, validation_loss_mode=True,
                                         return_attention=False)
@@ -236,49 +246,11 @@ def estimate_loss():
     return out
 
 
-@torch.no_grad()
 def evaluate_full_val(eval_model):
-    """
-    Score every validation patient in a fixed order with regular "no event" padding, so all runs
-    are evaluated on identical inputs. Returns mean CE and dt losses over all scored targets, and
-    CE on targets that are lab-linked diseases, overall and per group (with target counts).
-    """
-    eval_model.eval()
-    ignored = torch.tensor(list(ignore_tokens) + [1], device=device)  # as validation_loss_mode
-    groups = {g: torch.tensor(t, device=device) for g, t in lab_linked_groups.items()}
-    if groups:
-        groups = {'linked': torch.unique(torch.cat(list(groups.values()))), **groups}
-    sums = {k: 0.0 for k in ['ce', 'dt', *groups]}
-    counts = {k: 0 for k in ['ce', *groups]}
-    for start in range(0, len(val_p2i), batch_size):
-        ix = torch.arange(start, min(start + batch_size, len(val_p2i)))
-        X, A, Y, B, V = fetch_batch('val', ix=ix, cut_batch=True)
-        with ctx:
-            logits, loss, _ = eval_model(X, A, Y, B, numeric_values=V, validation_loss_mode=True,
-                                         return_attention=False)
-        scored = ~torch.isin(Y, ignored)
-        n = int(scored.sum())
-        if n == 0:
-            continue
-        sums['ce'] += loss['loss_ce'].item() * n
-        sums['dt'] += loss['loss_dt'].item() * n
-        counts['ce'] += n
-        targets = Y[scored]
-        ce = F.cross_entropy(logits[scored].float(), targets, reduction='none')
-        for name, toks in groups.items():
-            m = torch.isin(targets, toks)
-            sums[name] += ce[m].sum().item()
-            counts[name] += int(m.sum())
-
-    out = {
-        'full_val_loss': (sums['ce'] + sums['dt']) / counts['ce'],
-        'full_val_ce': sums['ce'] / counts['ce'],
-        'full_val_dt': sums['dt'] / counts['ce'],
-    }
-    for name in groups:
-        out[f'full_val_ce_{name}'] = sums[name] / counts[name] if counts[name] else None
-        out[f'full_val_n_{name}'] = counts[name]
-    return out
+    """Every validation patient, fixed order and padding (see utils.evaluate_split)."""
+    out = evaluate_split(eval_model, val_data, val_p2i, val_values, values_stats, lab_linked_groups,
+                         ignore_tokens, block_size, batch_size, device, no_event_token_rate, ctx)
+    return {f'full_val_{k}': v for k, v in out.items()}
 
 
 # learning rate decay scheduler (cosine with warmup)
@@ -321,7 +293,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and iter_num > 0:
+    if (iter_num % eval_interval == 0 or iter_num >= max_iters) and iter_num > 0:
         losses = estimate_loss()
         last_val_losses = losses['val']
         val_loss = losses['val'].sum().item()
@@ -334,37 +306,33 @@ while True:
             "val/loss_dt": losses['val'][1].item()
         })
 
-        if always_save_checkpoint or best_val_loss > val_loss:
-            if iter_num > 0:
-                checkpoint = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': val_loss,
-                    'config': config,
-                    'values_stats': values_stats,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-
-        if best_val_loss > val_loss:
+        improved = val_loss < best_val_loss
+        if improved:
             best_val_loss = val_loss
             best_val_losses = losses['val']
             best_iter = iter_num
+        checkpoint = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'best_iter': best_iter,
+            'config': config,
+            'values_stats': values_stats,
+        }
+        # ckpt_last.pt: the latest state, for resuming and for the 'final' checkpoint rule;
+        # ckpt_best.pt: the lowest periodic val loss, for the 'best' rule
+        print(f"saving checkpoint to {out_dir}" + (" (new best)" if improved else ""))
+        torch.save(checkpoint, os.path.join(out_dir, 'ckpt_last.pt'))
+        if improved:
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt_best.pt'))
 
-        if iter_num % 10_000 == 0:
-            checkpoint = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'best_val_loss': best_val_loss,
-                'config': config,
-                'values_stats': values_stats,
-            }
-            print(f"saving checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
+    # stop after the eval at max_iters, so a run makes exactly max_iters updates
+    if iter_num >= max_iters:
+        if wandb_log:
+            wandb.log(metrics)
+        break
 
     if iter_num == 0 and eval_only:
         break
@@ -414,27 +382,31 @@ while True:
     iter_num += 1
     local_iter_num += 1
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
-
-# final evaluation of the best checkpoint on the whole validation set
+# final evaluation on the whole validation set: the final model (in memory) and the best checkpoint.
+# The checkpoint_rule decides which one is reported as full_val_*; the other is kept for sensitivity.
 raw_model = unoptimized_model if compile else model
-best_ckpt = os.path.join(out_dir, 'ckpt.pt')
+evals = {'final': evaluate_full_val(raw_model)}
+best_ckpt = os.path.join(out_dir, 'ckpt_best.pt')
 if os.path.exists(best_ckpt):
     state_dict = torch.load(best_ckpt, map_location=device, weights_only=False)['model']
-    raw_model.load_state_dict({k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k: v for k, v in state_dict.items()})
-full_val = evaluate_full_val(raw_model)
-print("full validation set (best checkpoint): " +
-      ", ".join(f"{k} {v:.4f}" for k, v in full_val.items() if isinstance(v, float)))
+    raw_model.load_state_dict({k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k: v
+                               for k, v in state_dict.items()})
+    evals['best'] = evaluate_full_val(raw_model)
+assert checkpoint_rule in evals, f"checkpoint_rule must be 'final' or 'best', got {checkpoint_rule!r}"
+full_val = evals[checkpoint_rule]
+other = {f'{rule}_{k}': v for rule, ev in evals.items() if rule != checkpoint_rule for k, v in ev.items()}
+for rule, ev in evals.items():
+    print(f"full validation set ({rule} checkpoint): " +
+          ", ".join(f"{k} {v:.4f}" for k, v in ev.items() if isinstance(v, float)))
 
 # one-line record per run, for comparing variants (see scripts/compare_runs.py)
 summary = {
     'out_dir': out_dir,
     'seed': seed,
-    'iters': iter_num - 1,
+    'iters': iter_num,
+    'checkpoint_rule': checkpoint_rule,
     'best_val_loss': best_val_loss if best_val_loss < 1e9 else None,
-    'best_iter': best_iter if best_val_losses is not None else None,
+    'best_iter': best_iter,
     'best_val_loss_ce': best_val_losses[0].item() if best_val_losses is not None else None,
     'best_val_loss_dt': best_val_losses[1].item() if best_val_losses is not None else None,
     'final_val_loss_ce': last_val_losses[0].item() if last_val_losses is not None else None,
@@ -443,6 +415,7 @@ summary = {
     'n_film_params': raw_model.get_num_film_params(),
     'ms_per_iter': 1000 * float(np.median(iter_times)) if iter_times else None,
     **full_val,
+    **other,
     **{k: model_args[k] for k in FILM_KEYS},
     'film_shuffle_values': film_shuffle_values,
 }

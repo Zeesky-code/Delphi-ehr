@@ -1,0 +1,7 @@
+{
+  "_comment": "Forecasting targets for forecast_eval.py: 3-character ICD-10 codes per target, fixed before looking at results. A patient is a case at the first recorded code of the group. Pregnancy codes (O10-O16, O24) are left out on purpose, as are hereditary/aplastic/acute blood-loss anaemias (D55-D62). To confirm with the supervisor: kidney = chronic kidney disease (N18) plus unspecified renal failure (N19), without acute kidney injury (N17).",
+  "diabetes": ["E10", "E11", "E12", "E13", "E14"],
+  "kidney": ["N18", "N19"],
+  "anaemia": ["D50", "D51", "D52", "D53", "D63", "D64"],
+  "hypertension": ["I10", "I11", "I12", "I13", "I15"]
+}

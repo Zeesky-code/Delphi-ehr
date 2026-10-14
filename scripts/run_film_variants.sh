@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Train the FiLM variants, one output folder per variant and seed:
-#   $RUNS_DIR/<variant>/seed<seed>/  (ckpt.pt, train.log, summary.json)
+#   $RUNS_DIR/<variant>/seed<seed>/  (ckpt_last.pt, ckpt_best.pt, train.log, summary.json)
 #
 # Usage:
 #   scripts/run_film_variants.sh                         # every variant
@@ -11,7 +11,7 @@
 # With wandb on, each run is named <variant>-seed<seed> and grouped by variant, so seeds average together.
 #
 # Safe to rerun after a disconnect: finished runs (summary.json present) are skipped, and a run with
-# a checkpoint but no summary resumes from that checkpoint (the best one saved so far).
+# a checkpoint but no summary resumes from its latest checkpoint.
 #
 # Environment:
 #   DATA=mimic4        dataset: mimic4 (default; build it with data/mimic/build_mimic4.py) or synthetic
@@ -78,7 +78,7 @@ while read -r name config overrides; do
             continue
         fi
         resume=()
-        if [ -f "$out/ckpt.pt" ]; then
+        if [ -f "$out/ckpt_last.pt" ] || [ -f "$out/ckpt.pt" ]; then
             echo "=== $name (seed $seed): resuming from checkpoint -> $out"
             resume=(--init_from=resume)
         else

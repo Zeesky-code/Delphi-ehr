@@ -2,7 +2,8 @@
 Compare FiLM variant runs written by scripts/run_film_variants.sh.
 
 Reads every <runs_dir>/<variant>/seed*/summary.json and prints, per variant, the mean (± std over
-seeds) of the end-of-run evaluation of the best checkpoint on the whole validation set:
+seeds) of the end-of-run evaluation on the whole validation set (of the checkpoint chosen by the run's
+checkpoint_rule), or with --split test, of the eval_test_<ckpt>.json files written by evaluate.py:
 
   val loss    CE + dt over all scored targets
   CE linked   CE on targets that are lab-linked diseases, the diseases a lab value can warn about.
@@ -11,9 +12,10 @@ seeds) of the end-of-run evaluation of the best checkpoint on the whole validati
 
 A second table breaks CE down by lab group (diabetes, kidney, death, ...).
 
-Usage: python3 scripts/compare_runs.py [runs_dir]   (default runs/film)
+Usage: python3 scripts/compare_runs.py [runs_dir] [--split test] [--ckpt last|best]   (default runs/film)
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -43,12 +45,27 @@ def print_table(table):
 
 
 def main():
-    runs_dir = Path(sys.argv[1] if len(sys.argv) > 1 else 'runs/film')
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('runs_dir', nargs='?', default='runs/film')
+    parser.add_argument('--split', choices=['val', 'test'],
+                        help='read eval_<split>_<ckpt>.json from evaluate.py instead of the training summaries')
+    parser.add_argument('--ckpt', default='last', choices=['last', 'best'])
+    args = parser.parse_args()
+    runs_dir = Path(args.runs_dir)
     groups = {}
     for path in sorted(runs_dir.glob('*/seed*/summary.json')):
-        groups.setdefault(path.parent.parent.name, []).append(json.loads(path.read_text()))
+        run = json.loads(path.read_text())
+        if args.split:
+            ev = path.parent / f'eval_{args.split}_{args.ckpt}.json'
+            if not ev.exists():
+                print(f'skipping {path.parent}: no {ev.name} (run evaluate.py --split {args.split})')
+                continue
+            run = {k: v for k, v in run.items() if not k.startswith('full_val_')}
+            run.update({f'full_val_{k}': v for k, v in json.loads(ev.read_text()).items()})
+        groups.setdefault(path.parent.parent.name, []).append(run)
     if not groups:
-        sys.exit(f'No summary.json files under {runs_dir}')
+        sys.exit(f'No runs to compare under {runs_dir}')
+    print(f"split: {args.split or 'val (training summaries)'}" + (f', checkpoint: {args.ckpt}' if args.split else ''))
     if not any('full_val_loss' in r for runs in groups.values() for r in runs):
         sys.exit('These summaries predate the full-validation evaluation; rerun with the current train.py')
 
@@ -66,7 +83,7 @@ def main():
 
     order = sorted(rows, key=lambda n: (n != 'baseline', rows[n]['linked'][0] or rows[n]['loss'][0] or 1e18))
 
-    table = [['variant', 'seeds', 'val loss', 'Δ loss', 'CE linked', 'Δ linked', 'val CE', 'val dt',
+    table = [['variant', 'seeds', 'loss', 'Δ loss', 'CE linked', 'Δ linked', 'CE', 'dt',
               'best iter', 'params', 'FiLM params', 'ms/iter']]
     for name in order:
         r, runs = rows[name], rows[name]['runs']
