@@ -423,7 +423,7 @@ raw_model = unoptimized_model if compile else model
 best_ckpt = os.path.join(out_dir, 'ckpt.pt')
 if os.path.exists(best_ckpt):
     state_dict = torch.load(best_ckpt, map_location=device, weights_only=False)['model']
-    raw_model.load_state_dict({k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()})
+    raw_model.load_state_dict({k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k: v for k, v in state_dict.items()})
 full_val = evaluate_full_val(raw_model)
 print("full validation set (best checkpoint): " +
       ", ".join(f"{k} {v:.4f}" for k, v in full_val.items() if isinstance(v, float)))

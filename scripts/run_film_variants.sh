@@ -10,6 +10,9 @@
 #
 # With wandb on, each run is named <variant>-seed<seed> and grouped by variant, so seeds average together.
 #
+# Safe to rerun after a disconnect: finished runs (summary.json present) are skipped, and a run with
+# a checkpoint but no summary resumes from that checkpoint (the best one saved so far).
+#
 # Environment:
 #   DATA=mimic4        dataset: mimic4 (default; build it with data/mimic/build_mimic4.py) or synthetic
 #   SEEDS="42 43 44"   seeds to run (default 42); use several before trusting small differences
@@ -46,6 +49,7 @@ ${ANCHOR}_numeric   $FILM --film_location=$ANCHOR --film_context=numeric
 ${ANCHOR}_layer0    $FILM --film_location=$ANCHOR --film_layers=0
 ${ANCHOR}_layers01  $FILM --film_location=$ANCHOR --film_layers=0,1
 ${ANCHOR}_h32       $FILM --film_location=$ANCHOR --film_hidden_dim=32
+attn_pre_shuffled       $FILM --film_location=attn_pre --film_shuffle_values=True
 qkv_shuffled            $FILM --film_location=qkv --film_shuffle_values=True
 ${ANCHOR}_numeric_shuffled  $FILM --film_location=$ANCHOR --film_context=numeric --film_shuffle_values=True
 "
@@ -68,11 +72,21 @@ while read -r name config overrides; do
     is_selected "$name" || continue
     for seed in $SEEDS; do
         out="$RUNS_DIR/$name/seed$seed"
+        if [ -f "$out/summary.json" ]; then
+            echo "=== $name (seed $seed): finished, skipping"
+            continue
+        fi
+        resume=()
+        if [ -f "$out/ckpt.pt" ]; then
+            echo "=== $name (seed $seed): resuming from checkpoint -> $out"
+            resume=(--init_from=resume)
+        else
+            echo "=== $name (seed $seed) -> $out"
+        fi
         mkdir -p "$out"
-        echo "=== $name (seed $seed) -> $out"
         # shellcheck disable=SC2086  # overrides is a word list on purpose
         "$PYTHON" train.py "$config" $overrides --seed="$seed" --out_dir="$out" \
             --wandb_run_name="$name-seed$seed" --wandb_group="$name" \
-            ${extra[@]+"${extra[@]}"} 2>&1 | tee "$out/train.log"
+            ${resume[@]+"${resume[@]}"} ${extra[@]+"${extra[@]}"} 2>&1 | tee -a "$out/train.log"
     done
 done <<< "$VARIANTS"

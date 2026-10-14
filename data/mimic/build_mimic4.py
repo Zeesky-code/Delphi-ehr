@@ -237,7 +237,7 @@ def split_patients(subject_ids, seed, fractions=(0.8, 0.1, 0.1)):
             'test': set(ids[n_train + n_val:])}
 
 
-def signal_report(events, labels):
+def signal_table(events, labels):
     """
     Per group and linked lab: AUC of values measured within 2 years before the patient's first
     diagnosis in the group (positives) against values from patients never diagnosed in it
@@ -247,7 +247,7 @@ def signal_report(events, labels):
     group_tokens = find_group_tokens(labels)
     first_value_raw = len(labels) - 1
     lab_raw = {name: first_value_raw + i for i, (name, *_) in enumerate(LAB_PANEL)}
-    print(f"\n  {'group':15s} {'lab':18s} {'n_pos':>8s} {'n_neg':>9s} {'AUC':>5s}")
+    rows = []
     for group, lab_signs in SIGNAL_LABS.items():
         dx = events[events['token'].isin(group_tokens[group])]
         first_dx = dx.groupby('subject_id')['age'].min()
@@ -257,8 +257,22 @@ def signal_report(events, labels):
             gap = dx_age - vals['age']
             pos = vals.loc[(gap > 0) & (gap <= SIGNAL_LEAD_DAYS), 'value'].to_numpy()
             neg = vals.loc[dx_age.isna(), 'value'].to_numpy()
-            auc = rank_auc(sign * pos, sign * neg)
-            print(f"  {group:15s} {lab:18s} {len(pos):8d} {len(neg):9d} {auc:5.2f}")
+            rows.append({'group': group, 'lab': lab, 'n_pos': len(pos), 'n_neg': len(neg),
+                         'auc': rank_auc(sign * pos, sign * neg)})
+    return pd.DataFrame(rows)
+
+
+def events_from_dataset(data_dir):
+    """Rebuild the event table (subject_id, age, token, value) from a written dataset's splits."""
+    parts = []
+    for split in ['train', 'val', 'test']:
+        path = os.path.join(data_dir, f'{split}.bin')
+        if os.path.exists(path):
+            d = np.fromfile(path, dtype=np.uint32).reshape(-1, 3)
+            v = np.fromfile(os.path.join(data_dir, f'{split}_values.bin'), dtype=np.float32)
+            parts.append(pd.DataFrame({'subject_id': d[:, 0], 'age': d[:, 1].astype(np.int64),
+                                       'token': d[:, 2].astype(np.int64), 'value': v}))
+    return pd.concat(parts, ignore_index=True)
 
 
 def write_dataset(events, labels, out_dir, seed, block_size):
@@ -328,7 +342,9 @@ def main():
     extended_labels = write_dataset(events, labels, args.out_dir, args.seed, args.block_size)
 
     print("\nsignal check (all patients):")
-    signal_report(events, labels)
+    signal = signal_table(events, labels)
+    signal.to_csv(os.path.join(args.out_dir, 'signal_check.csv'), index=False)
+    print(signal.to_string(index=False, float_format='%.2f'))
     print(f"\nvocab_size = {len(extended_labels)}; valued tokens are model ids "
           f"{len(labels)}-{len(extended_labels) - 1}. Output in {args.out_dir}/")
 

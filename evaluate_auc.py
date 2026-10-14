@@ -432,6 +432,12 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device to run the model on")
     parser.add_argument("--block_size", type=int, default=None, help="Context length (default: the model's)")
     parser.add_argument(
+        "--offset_days", type=float, default=0.1,
+        help="Predict each event only from tokens at least this many days before it. The default 0.1 uses "
+             "everything up to the event; e.g. 30 excludes labs from the admission whose discharge codes it "
+             "(forecasting rather than reading the diagnostic workup)",
+    )
+    parser.add_argument(
         "--diseases", choices=["common", "lab_linked"], default="common",
         help="common: all common diseases; lab_linked: only diseases in <input_path>/lab_linked_tokens.json",
     )
@@ -514,6 +520,7 @@ def main():
         device=device,
         seed=seed,
         n_bootstrap=args.n_bootstrap,
+        offset=args.offset_days,
     )
 
 

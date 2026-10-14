@@ -10,3 +10,7 @@ Delphi-*/
 __pycache__/
 *.pyc
 .DS_Store
+
+#report and script data
+scripts/lapsus
+report/
