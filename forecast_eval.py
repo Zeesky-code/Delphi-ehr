@@ -6,8 +6,12 @@ Design (one cutoff per patient, per target and gap):
   cases     patients whose first recorded code of the target lies at least `gap` days after one of
             their clinical events: the cutoff is the last such event, and the case counts if the
             diagnosis falls within the window (cutoff + gap, cutoff + gap + window_days]
-  controls  patients never coded with the target, with at least `gap` days of record after the
-            cutoff; the cutoff is one of their clinical events, drawn with a fixed seed
+  controls  patients never coded with the target: a time point is drawn uniformly (fixed seed) between
+            their first clinical event and `gap` days before their last event, and the cutoff is the
+            last clinical event at or before it. Cases and controls are thus both cut at "the last
+            event before a moment in time" (mostly the end of an admission); cutting controls at a random
+            event instead would mostly land mid-admission, where the model expects diagnoses soon, and
+            bias every model's AUROC downwards
   excluded  cases with no event at least `gap` days before the diagnosis or outside the window,
             and (with --washout_days) cases coded within that many days of their record's start,
             when the condition was probably already present
@@ -36,7 +40,7 @@ import numpy as np
 import torch
 
 from evaluate import data_dir_of, load_run, load_split
-from evaluate_auc import auc, get_auc_delong_var
+from evaluate_auc import compute_midrank, get_auc_delong_var
 from utils import get_batch, get_p2i
 
 LABELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'ukb_simulated_data', 'labels.csv')
@@ -88,11 +92,11 @@ def choose_cutoffs(data, p2i, raw_ids, gap, window_days, washout_days, rng):
                 continue
             label = 1
         else:
-            candidates = clinical[a[clinical] <= a[-1] - gap]
-            if len(candidates) == 0:
+            if len(clinical) == 0 or a[-1] - gap < a[clinical[0]]:
                 excluded['no_control_cutoff'] += 1
                 continue
-            cut = rng.choice(candidates)
+            moment = rng.uniform(a[clinical[0]], a[-1] - gap)
+            cut = clinical[a[clinical] <= moment][-1]
             label = 0
         patients.append(p)
         rows.append(start + cut)
@@ -139,12 +143,19 @@ def score(model, tdata, tvalues, tp2i, cut_ages, values_stats, model_ids, block_
     return np.concatenate(out)
 
 
+def auroc(cases, controls):
+    """P(case score > control score), ties counting half."""
+    n1, n2 = len(cases), len(controls)
+    ranks = compute_midrank(np.concatenate([cases, controls]).astype(np.float64))
+    return float((ranks[:n1].sum() - n1 * (n1 + 1) / 2) / (n1 * n2))
+
+
 def age_stratified_auc(scores, labels, ages_years, band=10):
     aucs = []
     for lo in np.arange(np.floor(ages_years.min() / band) * band, ages_years.max() + band, band):
         m = (ages_years >= lo) & (ages_years < lo + band)
         if labels[m].sum() >= 2 and (1 - labels[m]).sum() >= 2:
-            aucs.append(auc(scores[m & (labels == 1)], scores[m & (labels == 0)]))
+            aucs.append(auroc(scores[m & (labels == 1)], scores[m & (labels == 0)]))
     return float(np.mean(aucs)) if aucs else None
 
 
@@ -198,7 +209,7 @@ def main():
                     ages_years = cut_ages / 365.25
                     row.update({'auc': float(a), 'auc_ci_low': float(a) - half, 'auc_ci_high': float(a) + half,
                                 'auc_age_stratified': age_stratified_auc(s, labels, ages_years),
-                                'auc_age_only': float(auc(ages_years[labels == 1], ages_years[labels == 0]))})
+                                'auc_age_only': auroc(ages_years[labels == 1], ages_years[labels == 0])})
                 results.append(row)
                 tag = f'{name}_{int(gap)}'
                 arrays.update({f'{tag}_patient': patients, f'{tag}_label': labels, f'{tag}_score': s,
