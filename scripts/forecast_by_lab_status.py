@@ -19,12 +19,16 @@ if any earlier value met the threshold (stricter about "already visible"). A sin
 clinical diagnosis (which needs repeated or confirmed measurements), so group A means "a diagnostic
 value was on record", not "the patient had the disease".
 
+With --split_never, group C is split further into C1 (other lab or vital values before the cutoff, which
+FiLM can still use, e.g. glucose for diabetes) and C2 (no values at all: the strict negative control).
+This split was added after seeing the first results, so it is exploratory.
+
 Lab status comes from the true values, also for the shuffled-values model (it describes the patient).
 Reads the forecast_<split>_<ckpt>.npz files from forecast_eval.py, so no model is run. Prints a table and
 writes <runs_dir>/forecast_by_lab_status_<split>_<ckpt>_<rule>.json.
 
 Usage (from the repo root):
-    python3 scripts/forecast_by_lab_status.py runs/film-mimic4 --split test [--rule any]
+    python3 scripts/forecast_by_lab_status.py runs/film-mimic4 --split test [--rule any] [--split_never]
 """
 
 import argparse
@@ -44,6 +48,7 @@ FEMALE_RAW, MALE_RAW = 1, 2
 # target: (lab name as in the dataset's labels.csv, before the unit)
 TARGET_LAB = {'diabetes': 'HbA1c', 'kidney': 'Creatinine', 'anaemia': 'Hemoglobin', 'hypertension': 'Systolic_BP'}
 GROUPS = ['A diagnostic', 'B not diagnostic', 'C never measured']
+GROUPS_SPLIT = GROUPS[:2] + ['C1 other values only', 'C2 no values at all']
 MIN_PER_CLASS = 10  # fewer cases or controls in a group: no AUROC
 
 
@@ -73,14 +78,19 @@ def lab_raw_ids(data_dir):
     return {line.split(' (')[0]: i - 1 for i, line in enumerate(lines)}
 
 
-def lab_status(data, values, p2i, patients, rows, target, lab_raw, rule):
-    """Group index (0 = A, 1 = B, 2 = C) per patient, from the target's lab up to the cutoff row."""
+def lab_status(data, values, p2i, patients, rows, target, lab_raw, rule, split_never=False):
+    """
+    Group index per patient, from the target's lab up to the cutoff row: 0 = A, 1 = B, 2 = C, or with
+    split_never 2 = C1 (other values present) and 3 = C2 (no values at all).
+    """
     status = np.full(len(patients), 2)
     for k, (p, row) in enumerate(zip(patients, rows)):
         start = p2i[p][0]
         hist = data[start:row + 1]
         is_lab = (hist[:, 2] == lab_raw) & (values[start:row + 1] > 0)
         if not is_lab.any():
+            if split_never and not (values[start:row + 1] > 0).any():
+                status[k] = 3
             continue
         female = bool((hist[:, 2] == FEMALE_RAW).any())
         v = values[start:row + 1][is_lab].astype(np.float64)
@@ -108,6 +118,8 @@ def main():
     parser.add_argument('--data', default='data/mimic4_labs')
     parser.add_argument('--targets', default='config/forecast_targets.json')
     parser.add_argument('--variants', nargs='*', help='default: every variant with forecast results')
+    parser.add_argument('--split_never', action='store_true',
+                        help='split "never measured" into "other values only" and "no values at all"')
     args = parser.parse_args()
 
     # the same cutoffs as forecast_eval.py: its settings are stored in each result file
@@ -148,8 +160,9 @@ def main():
                 for arr in seeds.values():
                     assert np.array_equal(arr[f'{tag}_patient'], patients), \
                         f'{tag}: cutoffs differ from forecast_eval.py (other data, split or targets file?)'
-            status = lab_status(data, values, p2i, patients, rows, target, labs[TARGET_LAB[target]], args.rule)
-            for g, group in enumerate(GROUPS):
+            status = lab_status(data, values, p2i, patients, rows, target, labs[TARGET_LAB[target]], args.rule,
+                                args.split_never)
+            for g, group in enumerate(GROUPS_SPLIT if args.split_never else GROUPS):
                 m = status == g
                 n1, n0 = int(labels[m].sum()), int((1 - labels[m]).sum())
                 row = [target, f'{int(gap)}d', group, f'{n1}/{n0}']
@@ -180,7 +193,7 @@ def main():
     print(f'\nGroups by {"the latest value" if args.rule == "latest" else "any value"} of the defining lab up to '
           f'the cutoff. AUROC: mean ± sd over seeds; Δ: variant minus baseline, paired by seed. '
           f'"-": fewer than {MIN_PER_CLASS} cases or controls.')
-    out = Path(args.runs_dir) / f'forecast_by_lab_status_{args.split}_{args.ckpt}_{args.rule}.json'
+    out = Path(args.runs_dir) / f'forecast_by_lab_status_{args.split}_{args.ckpt}_{args.rule}{"_split" if args.split_never else ""}.json'
     out.write_text(json.dumps({'split': args.split, 'ckpt': args.ckpt, 'rule': args.rule, 'results': results},
                               indent=2))
     print(f'wrote {out}')
