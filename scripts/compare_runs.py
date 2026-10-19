@@ -101,7 +101,8 @@ def main():
                          for k in r if k.startswith('full_val_ce_')} - {'linked'})
     if lab_groups:
         first = rows[order[0]]['runs'][0]
-        print('\nCE on each group\'s diseases (number of validation targets in brackets)')
+        split = {'test': 'test', 'train': 'training'}.get(args.split, 'validation')
+        print(f'\nCE on each group\'s diseases (number of {split} targets in brackets)')
         table = [['variant'] + [f"{g} ({first.get(f'full_val_n_{g}', '?')})" for g in lab_groups]]
         for name in order:
             table.append([name] + [fmt(stat(rows[name]['runs'], f'full_val_ce_{g}')[0]) for g in lab_groups])
