@@ -28,8 +28,14 @@ This predicts a future recorded diagnosis, not disease onset.
 
 Writes <run>/forecast_<split>_<ckpt>.json and .npz (per-patient scores for paired comparisons).
 
+--drop_values LAB [LAB ...] (FiLM runs only) replaces every value of these labs by the training average
+(z-score 0) while keeping the tokens, so the model still sees that the test was done but not its result.
+Results go to <runs_dir>/<variant>_drop-<LAB>/<seed>/, which the comparison scripts treat as one more
+variant: its difference from the full FiLM model is what that lab's values contribute.
+
 Usage:
     python3 forecast_eval.py runs/film-mimic4/*/seed* --split test [--gaps 30 60 365] [--window_days 365]
+    python3 forecast_eval.py runs/film-mimic4/attn_pre/seed* --split test --drop_values Glucose
 """
 
 import argparse
@@ -63,6 +69,21 @@ def target_raw_ids(targets_path):
             raise ValueError(f'{name}: codes not in the vocabulary: {missing}')
         targets[name] = np.array([code_to_raw[c] for c in codes])
     return targets
+
+
+def lab_raw_ids(data_dir):
+    """{lab name: raw token id} from the dataset's labels.csv (line i is model id i, raw id i - 1)."""
+    lines = [line.rstrip('\n') for line in open(os.path.join(data_dir, 'labels.csv'))]
+    return {line.split(' (')[0]: i - 1 for i, line in enumerate(lines)}
+
+
+def drop_values(data, values, values_stats, raw_ids):
+    """Copy of values with each given lab's values set to its training average (z-score 0)."""
+    out = values.copy()
+    for raw in raw_ids:
+        rows = (data[:, 2] == raw) & (out > 0)
+        out[rows] = np.exp(values_stats[raw][0])
+    return out
 
 
 def choose_cutoffs(data, p2i, raw_ids, gap, window_days, washout_days, rng):
@@ -175,6 +196,8 @@ def main():
     parser.add_argument('--data', help='dataset directory (default: data/<dataset of the run>)')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--drop_values', nargs='+', metavar='LAB',
+                        help='set these labs\' values to the training average (FiLM runs only), e.g. Glucose')
     args = parser.parse_args()
 
     targets = target_raw_ids(args.targets)
@@ -183,6 +206,22 @@ def main():
         model, checkpoint = load_run(run_dir, args.ckpt, args.device)
         data_dir = data_dir_of(checkpoint, args.data)
         data, values = load_split(data_dir, args.split, checkpoint)
+        out_dir = run_dir
+        if args.drop_values:
+            if values is None:
+                print(f'skipping {run_dir}: --drop_values needs a FiLM run')
+                continue
+            labs = lab_raw_ids(data_dir)
+            unknown = [lab for lab in args.drop_values if lab not in labs]
+            if unknown:
+                raise ValueError(f'labs not in {data_dir}/labels.csv: {unknown}')
+            values = drop_values(data, values, {int(k): v for k, v in checkpoint['values_stats'].items()},
+                                 [labs[lab] for lab in args.drop_values])
+            run = os.path.normpath(run_dir)
+            out_dir = os.path.join(os.path.dirname(os.path.dirname(run)),
+                                   os.path.basename(os.path.dirname(run)) + '_drop-' + '-'.join(args.drop_values),
+                                   os.path.basename(run))
+            os.makedirs(out_dir, exist_ok=True)
         p2i = get_p2i(data)
         block_size = checkpoint['model_args']['block_size']
         rate = checkpoint['config'].get('no_event_token_rate', 5)
@@ -214,15 +253,16 @@ def main():
                 tag = f'{name}_{int(gap)}'
                 arrays.update({f'{tag}_patient': patients, f'{tag}_label': labels, f'{tag}_score': s,
                                f'{tag}_age': cut_ages})
-                print(f"{run_dir} | {name:13s} gap {int(gap):4d}d: {n_cases:5d} cases / {n_controls:6d} controls, "
+                print(f"{out_dir} | {name:13s} gap {int(gap):4d}d: {n_cases:5d} cases / {n_controls:6d} controls, "
                       f"AUROC {row.get('auc', float('nan')):.3f} "
                       f"[{row.get('auc_ci_low', float('nan')):.3f}, {row.get('auc_ci_high', float('nan')):.3f}], "
                       f"age-stratified {row.get('auc_age_stratified') or float('nan'):.3f}, "
                       f"age alone {row.get('auc_age_only', float('nan')):.3f}")
         print('leakage check passed: no input event after its cutoff; '
               'lab values normalised with statistics from the training split (saved in the checkpoint)')
-        out = os.path.join(run_dir, f'forecast_{args.split}_{args.ckpt}')
+        out = os.path.join(out_dir, f'forecast_{args.split}_{args.ckpt}')
         meta = {'split': args.split, 'ckpt': os.path.basename(checkpoint['path']), 'seed': args.seed,
+                'run': run_dir, 'drop_values': args.drop_values,
                 'gaps': args.gaps, 'window_days': args.window_days, 'washout_days': args.washout_days,
                 'targets': {k: json.load(open(args.targets))[k] for k in targets}}
         with open(out + '.json', 'w') as f:

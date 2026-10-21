@@ -41,7 +41,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from compare_forecasts import paired_delong  # noqa: E402  (scripts/ is on sys.path when run as a script)
-from forecast_eval import auroc, choose_cutoffs, target_raw_ids  # noqa: E402
+from forecast_eval import auroc, choose_cutoffs, lab_raw_ids, target_raw_ids  # noqa: E402
 from utils import get_p2i  # noqa: E402
 
 FEMALE_RAW, MALE_RAW = 1, 2
@@ -70,12 +70,6 @@ def is_diagnostic(target, values, age_years, female):
     if target == 'hypertension':
         return values >= 140
     raise ValueError(target)
-
-
-def lab_raw_ids(data_dir):
-    """{lab name: raw token id} from the dataset's labels.csv (line i is model id i, raw id i - 1)."""
-    lines = [line.rstrip('\n') for line in open(os.path.join(data_dir, 'labels.csv'))]
-    return {line.split(' (')[0]: i - 1 for i, line in enumerate(lines)}
 
 
 def lab_status(data, values, p2i, patients, rows, target, lab_raw, rule, split_never=False):
