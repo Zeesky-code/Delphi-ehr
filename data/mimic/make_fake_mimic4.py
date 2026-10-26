@@ -2,7 +2,8 @@
 Write a small random dataset in the build_mimic4.py output format, for crash-testing the training,
 sweep and evaluation code without MIMIC access. The data is random: it says nothing about results.
 
-Usage: python3 data/mimic/make_fake_mimic4.py OUT_DIR [--patients 800]
+Usage: python3 data/mimic/make_fake_mimic4.py OUT_DIR [--patients 800] [--icd9_gem 2018_I9gem.txt]
+With --icd9_gem, diagnoses are built as with build_mimic4.py --icd9 map (some patients ICD-9 only).
        python3 train.py config/train_delphi_mimic4_film.py --dataset=$PWD/OUT_DIR --device=cpu --max_iters=4
 """
 
@@ -18,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_mimic4 as b  # noqa: E402
 
 
-def fake_tables(n_patients, rng):
+def fake_tables(n_patients, rng, icd9_codes=None):
     labels = b.load_labels(b.DELPHI_LABELS)
     codes = [label.split()[0] for label in labels[13:1269]][:300] + ['Z87', 'Y92', 'R07']  # some unmapped
     patients = pd.DataFrame({
@@ -46,6 +47,16 @@ def fake_tables(n_patients, rng):
     subjects = rng.choice(patients['subject_id'], n_dx)
     diagnoses = pd.DataFrame({'subject_id': subjects, 'code3': rng.choice(codes, n_dx), 'time': times(subjects)})
     diagnoses = diagnoses.groupby(['subject_id', 'code3'], as_index=False)['time'].min()
+    patients['has_icd10'] = True
+    if icd9_codes is not None:  # full codes of both versions, as the --icd9 map extraction returns them
+        patients['window_start'] = pd.NaT
+        only9 = set(rng.choice(patients['subject_id'], n_patients // 3, replace=False))
+        patients['has_icd10'] = ~patients['subject_id'].isin(only9)
+        is9 = diagnoses['subject_id'].isin(only9) | (rng.random(len(diagnoses)) < .3)
+        diagnoses = diagnoses.assign(icd_code=diagnoses['code3'] + '9', icd_version=10)
+        diagnoses.loc[is9, 'icd_code'] = rng.choice(icd9_codes, int(is9.sum()))
+        diagnoses.loc[is9, 'icd_version'] = 9
+        diagnoses = diagnoses.drop(columns='code3')
     return labels, {
         'patients': patients, 'diagnoses': diagnoses,
         'labs': valued([x for x in b.LAB_PANEL if x[1] == 'lab'], 40 * n_patients),
@@ -56,10 +67,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('out_dir')
     parser.add_argument('--patients', type=int, default=800)
+    parser.add_argument('--icd9_gem', help='CMS GEM file: also make ICD-9 diagnoses and map them')
     args = parser.parse_args()
-    labels, tables = fake_tables(args.patients, np.random.default_rng(0))
+    gem = b.load_icd9_gem(args.icd9_gem) if args.icd9_gem else None
+    labels, tables = fake_tables(args.patients, np.random.default_rng(0), None if gem is None else sorted(gem))
+    train_only = ()
+    if gem is not None:
+        tables['diagnoses'], coverage = b.map_icd9(tables['diagnoses'], gem)
+        print(coverage)
+        train_only = set(tables['patients'].loc[~tables['patients']['has_icd10'], 'subject_id'])
     events, _ = b.build_events(tables, labels)
-    b.write_dataset(events, labels, args.out_dir, seed=42, block_size=256)
+    b.write_dataset(events, labels, args.out_dir, seed=42, block_size=256, train_only=train_only)
     b.signal_table(events, labels).to_csv(os.path.join(args.out_dir, 'signal_check.csv'), index=False)
 
 

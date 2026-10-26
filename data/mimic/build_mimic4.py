@@ -2,10 +2,14 @@
 Build a Delphi dataset with numeric lab values from MIMIC-IV (BigQuery), in the same format as
 data/ukb_simulated_data_with_labs, so train.py, the FiLM sweep and evaluate_auc.py run unchanged.
 
-Cohort and timeline (ICD-10 only):
+Cohort and timeline, --icd9 drop (default, ICD-10 only):
   - patients with at least one admission coded in ICD-10
   - each patient's timeline starts at the discharge of their last ICD-9-coded admission (if any),
     so no stays with dropped diagnoses fall inside the record. this is a design choice for simplicity
+With --icd9 map, ICD-9 diagnoses are mapped to ICD-10 with the CMS General Equivalence Mappings
+(--icd9_gem, the 2018 2018_I9gem.txt), so every patient with a diagnosis is kept with their whole record.
+Patients coded only in ICD-9 go to the training split; everyone else gets the same split as with
+--icd9 drop, so the validation and test patients are the same (their records start earlier).
   - diagnoses: first occurrence of each 3-character ICD-10 code, at the discharge time of the
     admission it was coded in (codes are assigned at discharge), mapped to Delphi's vocabulary;
     codes outside it (mostly R, S-T, V-Y, Z chapters) are dropped, as in Delphi
@@ -75,12 +79,19 @@ ORDER_SEX, ORDER_VALUE, ORDER_DX, ORDER_DEATH = 0, 1, 2, 3  # tie-break for even
 
 # ─── BigQuery extraction ──────────────────────────────────────────────────────────
 
-def extraction_queries(hosp, outpatient_months):
+def extraction_queries(hosp, outpatient_months, icd9='drop'):
     adm, pat, dx = f"`{hosp}.admissions`", f"`{hosp}.patients`", f"`{hosp}.diagnoses_icd`"
     lab, omr = f"`{hosp}.labevents`", f"`{hosp}.omr`"
-    cohort = f"""
+    if icd9 == 'map':  # every patient with a diagnosis, whole record
+        cohort = f"""
     cohort AS (
-      SELECT a.subject_id, MAX(IF(d.icd_version = 9, a.dischtime, NULL)) AS window_start
+      SELECT subject_id, CAST(NULL AS DATETIME) AS window_start, LOGICAL_OR(icd_version = 10) AS has_icd10
+      FROM {dx}
+      GROUP BY subject_id)"""
+    else:
+        cohort = f"""
+    cohort AS (
+      SELECT a.subject_id, MAX(IF(d.icd_version = 9, a.dischtime, NULL)) AS window_start, TRUE AS has_icd10
       FROM {adm} a JOIN {dx} d USING (subject_id, hadm_id)
       GROUP BY a.subject_id
       HAVING LOGICAL_OR(d.icd_version = 10))"""
@@ -99,10 +110,17 @@ def extraction_queries(hosp, outpatient_months):
     return {
         'patients': f"""
         WITH {cohort}
-        SELECT p.subject_id, p.gender, p.anchor_age, p.anchor_year, p.dod, c.window_start
+        SELECT p.subject_id, p.gender, p.anchor_age, p.anchor_year, p.dod, c.window_start, c.has_icd10
         FROM {pat} p JOIN cohort c USING (subject_id)""",
 
+        # with --icd9 map: full codes of both versions, mapped to 3-character ICD-10 in map_icd9
         'diagnoses': f"""
+        WITH {cohort}
+        SELECT d.subject_id, d.icd_code, d.icd_version, MIN(a.dischtime) AS time
+        FROM {dx} d
+        JOIN {adm} a USING (subject_id, hadm_id)
+        JOIN cohort c USING (subject_id)
+        GROUP BY 1, 2, 3""" if icd9 == 'map' else f"""
         WITH {cohort}
         SELECT d.subject_id, SUBSTR(d.icd_code, 1, 3) AS code3, MIN(a.dischtime) AS time
         FROM {dx} d
@@ -140,13 +158,13 @@ def extraction_queries(hosp, outpatient_months):
     }
 
 
-def extract(project, hosp, outpatient_months, max_gb, cache_dir):
+def extract(project, hosp, outpatient_months, max_gb, cache_dir, icd9='drop'):
     from google.cloud import bigquery
     client = bigquery.Client(project=project)
     job_config = bigquery.QueryJobConfig(maximum_bytes_billed=int(max_gb * 1e9))
     os.makedirs(cache_dir, exist_ok=True)
     tables = {}
-    for name, sql in extraction_queries(hosp, outpatient_months).items():
+    for name, sql in extraction_queries(hosp, outpatient_months, icd9).items():
         print(f"querying {name}...")
         job = client.query(sql, job_config=job_config)
         df = job.to_dataframe()
@@ -159,6 +177,46 @@ def extract(project, hosp, outpatient_months, max_gb, cache_dir):
 def load_cache(cache_dir):
     return {name: pd.read_parquet(os.path.join(cache_dir, f'{name}.parquet'))
             for name in ['patients', 'diagnoses', 'labs', 'omr']}
+
+
+# ─── ICD-9 to ICD-10 ──────────────────────────────────────────────────────────────
+
+def load_icd9_gem(path):
+    """
+    ICD-9-CM code -> its 3-character ICD-10 codes, from the CMS GEM file (2018_I9gem.txt: code, target,
+    flags = approximate, no map, combination, scenario, choice list). Codes without a mapping are left
+    out. A combination code maps to several codes (first scenario, first option of each choice list);
+    otherwise the alternatives are one-or-another, so the most common 3-character target is used
+    (ties: the first listed).
+    """
+    gem = pd.read_csv(path, sep=r'\s+', header=None, names=['icd9', 'icd10', 'flags'], dtype=str)
+    flags = gem['flags'].str
+    gem = gem[flags[1] == '0'].assign(code3=gem['icd10'].str[:3], combination=flags[2] == '1',
+                                      scenario=flags[3], choice=flags[4])
+    mapping = {}
+    for icd9, rows in gem.groupby('icd9', sort=False):
+        if rows['combination'].any():
+            rows = rows[rows['scenario'] == rows['scenario'].min()].drop_duplicates('choice')
+            mapping[icd9] = list(dict.fromkeys(rows['code3']))
+        else:
+            targets = rows['code3'].tolist()
+            mapping[icd9] = [max(dict.fromkeys(targets), key=targets.count)]
+    return mapping
+
+
+def map_icd9(diagnoses, gem):
+    """Full-code diagnoses of both versions -> first occurrence of each 3-character ICD-10 code."""
+    code = diagnoses['icd_code'].astype(str).str.strip()
+    is9 = diagnoses['icd_version'] == 9
+    dx10 = diagnoses.loc[~is9, ['subject_id', 'time']].assign(code3=code[~is9].str[:3])
+    pairs = pd.DataFrame([(k, c) for k, cs in gem.items() for c in cs], columns=['icd_code', 'code3'])
+    dx9 = diagnoses.loc[is9, ['subject_id', 'time']].assign(icd_code=code[is9]).merge(pairs, on='icd_code')
+    unmapped = ~code[is9].isin(gem.keys())
+    coverage = {
+        'icd9_rows': int(is9.sum()), 'icd9_rows_unmapped': int(unmapped.sum()),
+        'top_unmapped_icd9': code[is9][unmapped].value_counts().head(10).to_dict()}
+    dx = pd.concat([dx10, dx9[['subject_id', 'time', 'code3']]], ignore_index=True)
+    return dx.groupby(['subject_id', 'code3'], as_index=False)['time'].min(), coverage
 
 
 # ─── Building the token sequences ─────────────────────────────────────────────────
@@ -228,12 +286,13 @@ def build_events(tables, labels):
     return events, coverage
 
 
-def split_patients(subject_ids, seed, fractions=(0.8, 0.1, 0.1)):
-    ids = np.array(sorted(subject_ids))
+def split_patients(subject_ids, seed, fractions=(0.8, 0.1, 0.1), train_only=()):
+    """train_only patients all go to train; the others are split as if train_only were absent."""
+    ids = np.array(sorted(set(subject_ids) - set(train_only)))
     rng = np.random.default_rng(seed)
     rng.shuffle(ids)
     n_train, n_val = int(fractions[0] * len(ids)), int(fractions[1] * len(ids))
-    return {'train': set(ids[:n_train]), 'val': set(ids[n_train:n_train + n_val]),
+    return {'train': set(ids[:n_train]) | set(train_only), 'val': set(ids[n_train:n_train + n_val]),
             'test': set(ids[n_train + n_val:])}
 
 
@@ -275,7 +334,7 @@ def events_from_dataset(data_dir):
     return pd.concat(parts, ignore_index=True)
 
 
-def write_dataset(events, labels, out_dir, seed, block_size):
+def write_dataset(events, labels, out_dir, seed, block_size, train_only=()):
     os.makedirs(out_dir, exist_ok=True)
     value_names = [f"{name} ({unit})" for name, _, _, unit, *_ in LAB_PANEL]
     extended_labels = labels + value_names
@@ -292,7 +351,7 @@ def write_dataset(events, labels, out_dir, seed, block_size):
             'groups': {g: sorted(int(t) + 1 for t in toks) for g, toks in find_group_tokens(labels).items()},
         }, f, indent=1)
 
-    splits = split_patients(events['subject_id'].unique(), seed)
+    splits = split_patients(events['subject_id'].unique(), seed, train_only=train_only)
     for split, ids in splits.items():
         part = events[events['subject_id'].isin(ids)]
         rows = np.stack([part['subject_id'].to_numpy(), part['age'].to_numpy(), part['token'].to_numpy()], 1)
@@ -317,7 +376,13 @@ def main():
     parser.add_argument('--block_size', type=int, default=256, help='only used to report sequence lengths')
     parser.add_argument('--max_gb', type=float, default=100, help='per-query cap on GB billed')
     parser.add_argument('--seed', type=int, default=42, help='seed for the train/val/test split')
+    parser.add_argument('--icd9', default='drop', choices=['drop', 'map'],
+                        help='drop: ICD-10 only, records start after the last ICD-9 admission; '
+                             'map: map ICD-9 to ICD-10 and keep whole records (needs --icd9_gem)')
+    parser.add_argument('--icd9_gem', help='CMS GEM file 2018_I9gem.txt, for --icd9 map')
     args = parser.parse_args()
+    if args.icd9 == 'map' and not args.icd9_gem:
+        parser.error('--icd9 map needs --icd9_gem')
 
     cache_dir = os.path.join(args.out_dir, 'raw')
     if args.from_cache:
@@ -325,7 +390,20 @@ def main():
     else:
         if not args.project:
             parser.error('--project is required unless --from_cache')
-        tables = extract(args.project, args.hosp, args.outpatient_months, args.max_gb, cache_dir)
+        tables = extract(args.project, args.hosp, args.outpatient_months, args.max_gb, cache_dir, args.icd9)
+    if ('icd_code' in tables['diagnoses']) != (args.icd9 == 'map'):
+        sys.exit(f'{cache_dir} was extracted with the other --icd9 setting; use another --out_dir')
+
+    train_only = ()
+    if args.icd9 == 'map':
+        tables['diagnoses'], icd9_coverage = map_icd9(tables['diagnoses'], load_icd9_gem(args.icd9_gem))
+        patients = tables['patients']
+        train_only = set(patients.loc[~patients['has_icd10'].astype(bool), 'subject_id'])
+        print(f"ICD-9 mapping: {icd9_coverage['icd9_rows'] - icd9_coverage['icd9_rows_unmapped']:,} of "
+              f"{icd9_coverage['icd9_rows']:,} ICD-9 diagnosis rows mapped; most common unmapped: "
+              f"{icd9_coverage['top_unmapped_icd9']}")
+        print(f"  {len(train_only):,} patients coded only in ICD-9 (all in train), "
+              f"{len(patients) - len(train_only):,} with ICD-10")
 
     labels = load_labels(DELPHI_LABELS)
     print("\nbuilding sequences...")
@@ -339,7 +417,7 @@ def main():
           f"diagnoses {counts.get(ORDER_DX, 0) / len(events):.0%}, deaths {counts.get(ORDER_DEATH, 0):,})")
 
     print("\nwriting splits...")
-    extended_labels = write_dataset(events, labels, args.out_dir, args.seed, args.block_size)
+    extended_labels = write_dataset(events, labels, args.out_dir, args.seed, args.block_size, train_only)
 
     print("\nsignal check (all patients):")
     signal = signal_table(events, labels)
