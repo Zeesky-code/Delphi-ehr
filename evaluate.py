@@ -5,7 +5,8 @@ test split is only touched when we decide to (the abstract's numbers come from h
 For each run directory, loads ckpt_last.pt ('final' checkpoint rule) or ckpt_best.pt, scores every
 patient of the split with utils.evaluate_split (fixed order, regular padding; CE overall and on the
 lab-linked diseases, per group) and writes <run>/eval_<split>_<ckpt>.json.
-compare_runs.py --split test reads these files.
+compare_runs.py --split test reads these files. Scoring on another dataset (--data) needs --tag, which
+goes into the file name (eval_<split>_<ckpt>_<tag>.json), so the run's own results are not overwritten.
 
 Usage:
     python3 evaluate.py runs/film-mimic4/*/seed* --split test [--ckpt last|best] [--device cuda]
@@ -41,12 +42,15 @@ def load_run(run_dir, ckpt='last', device='cpu'):
 
 def load_split(data_dir, split, checkpoint):
     """
-    Events of a split and, for FiLM models, its lab values: shuffled exactly as in training for the
-    shuffled-values control, and normalised later with the statistics saved from the training split.
+    Events of a split and, for models that use values (FiLM or binned), its lab values: shuffled exactly
+    as in training for the shuffled-values control, and normalised later with the statistics saved from
+    the training split.
     """
     data = np.fromfile(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint32).reshape(-1, 3).astype(np.int64)
     values = None
-    if checkpoint['model_args'].get('use_film') and checkpoint.get('values_stats') is not None:
+    model_args = checkpoint['model_args']
+    uses_values = model_args.get('use_film') or model_args.get('value_bins', 0) > 0
+    if uses_values and checkpoint.get('values_stats') is not None:
         values = np.fromfile(os.path.join(data_dir, f'{split}_values.bin'), dtype=np.float32)
         if checkpoint.get('config', {}).get('film_shuffle_values'):
             values = shuffle_values_within_tokens(data, values)
@@ -66,7 +70,10 @@ def main():
     parser.add_argument('--data', help='dataset directory (default: data/<dataset of the run>)')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--tag', help='added to the output file name; required with --data')
     args = parser.parse_args()
+    if args.data and not args.tag:
+        parser.error('--data needs --tag, so the run\'s own eval file is not overwritten')
 
     for run_dir in args.runs:
         model, checkpoint = load_run(run_dir, args.ckpt, args.device)
@@ -78,9 +85,9 @@ def main():
         result = evaluate_split(model, data, get_p2i(data), values, checkpoint.get('values_stats'), groups,
                                 checkpoint['model_args']['ignore_tokens'], checkpoint['model_args']['block_size'],
                                 args.batch_size, args.device, conf.get('no_event_token_rate', 5))
-        result = {'split': args.split, 'ckpt': os.path.basename(checkpoint['path']),
+        result = {'split': args.split, 'ckpt': os.path.basename(checkpoint['path']), 'data': data_dir,
                   'iter_num': checkpoint['iter_num'], 'seed': conf.get('seed'), **result}
-        out = os.path.join(run_dir, f'eval_{args.split}_{args.ckpt}.json')
+        out = os.path.join(run_dir, f'eval_{args.split}_{args.ckpt}{"_" + args.tag if args.tag else ""}.json')
         with open(out, 'w') as f:
             json.dump(result, f, indent=2)
         print(f"{run_dir}: loss {result['loss']:.4f}, CE {result['ce']:.4f}, "

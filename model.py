@@ -262,9 +262,23 @@ class DelphiConfig:
     film_context: str = 'hidden'  # generator input: 'numeric' (value only) or 'hidden' (value + hidden state)
     film_hidden_dim: int = 0  # generator width; 0 means n_embd
     film_scale: float = 0.1  # bound on |gamma| and |beta|
+    # Comparator to FiLM: binned values. With value_bins > 0, each value falls into one of value_bins
+    # quantile bins of its lab's training z-scores, and a learned vector per (lab, bin) is added to the
+    # lab token's embedding, like separate low/mid/high tokens. value_bin_tokens are the model token ids
+    # that carry values, value_bin_edges their bin edges in z-score units (value_bins - 1 each); train.py
+    # fills both from the training split.
+    value_bins: int = 0
+    value_bin_tokens: list = field(default_factory=list)
+    value_bin_edges: list = field(default_factory=list)
     ignore_tokens: list = field(default_factory=lambda: [0])
 
     def __post_init__(self):
+        if self.value_bins:
+            if self.use_film:
+                raise ValueError("value_bins is a comparator to FiLM: use one or the other")
+            if self.value_bins < 2 or len(self.value_bin_tokens) != len(self.value_bin_edges) or \
+                    any(len(e) != self.value_bins - 1 for e in self.value_bin_edges):
+                raise ValueError("value_bins needs >= 2 bins and value_bins - 1 edges per value token")
         if not self.use_film:
             return
         for name, allowed in (('film_location', FILM_LOCATIONS), ('film_mode', FILM_MODES),
@@ -312,6 +326,21 @@ class Delphi(nn.Module):
             if isinstance(module, FiLM):
                 module.reset_identity()
 
+        # Binned values (comparator): one vector per (value token, bin), zero at the start so the model
+        # starts as the baseline. value_slot maps a model token id to its row block (-1: no value).
+        self.value_bin_emb = None
+        if config.value_bins:
+            n_tok = len(config.value_bin_tokens)
+            self.value_bin_emb = nn.Embedding(n_tok * config.value_bins, config.n_embd)
+            nn.init.zeros_(self.value_bin_emb.weight)
+            slot = torch.full((config.vocab_size,), -1, dtype=torch.long)
+            slot[torch.tensor(config.value_bin_tokens, dtype=torch.long)] = torch.arange(n_tok)
+            self.register_buffer('value_slot', slot, persistent=False)
+            self.register_buffer('value_bin_edges', torch.tensor(config.value_bin_edges, dtype=torch.float32)
+                                 .view(n_tok, config.value_bins - 1), persistent=False)
+            print("binned values: %d tokens x %d bins, %.3fM parameters"
+                  % (n_tok, config.value_bins, self.value_bin_emb.weight.numel() / 1e6))
+
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
         if config.use_film:
@@ -351,6 +380,8 @@ class Delphi(nn.Module):
         # pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        if self.value_bin_emb is not None and numeric_values is not None:
+            tok_emb = tok_emb + self.binned_value_embedding(idx, numeric_values)
         #pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         age_emb = self.transformer.wae(age.unsqueeze(-1)) # age embeddings of shape (b, t, n_embd)
         #age_emb = self.transformer.mlp(age_emb)
@@ -421,6 +452,20 @@ class Delphi(nn.Module):
             loss = None
 
         return logits, loss, att
+
+    def value_bins_of(self, idx, numeric_values):
+        """Bin (0 .. value_bins - 1) of each valued token, -1 elsewhere. A z-score on an edge goes below it."""
+        slot = self.value_slot[idx]
+        has_value = (numeric_values[..., 1] > 0) & (slot >= 0)
+        edges = self.value_bin_edges[slot.clamp(min=0)]  # (b, t, value_bins - 1)
+        bins = (numeric_values[..., 0].unsqueeze(-1) > edges).sum(-1)
+        return torch.where(has_value, bins, torch.full_like(bins, -1))
+
+    def binned_value_embedding(self, idx, numeric_values):
+        """(b, t, n_embd): the vector of each valued token's (token, bin), zero for tokens without a value."""
+        bins = self.value_bins_of(idx, numeric_values)
+        rows = self.value_slot[idx].clamp(min=0) * self.config.value_bins + bins.clamp(min=0)
+        return self.value_bin_emb(rows) * (bins >= 0).unsqueeze(-1).to(self.value_bin_emb.weight.dtype)
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

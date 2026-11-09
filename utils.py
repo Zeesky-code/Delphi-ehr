@@ -40,6 +40,24 @@ def log_value_stats(data, values, min_count=100):
     return stats
 
 
+def value_bin_edges_of(data, values, values_stats, n_bins):
+    """
+    Quantile bin edges of each value token's training z-scores, computed as get_batch does (z-score of
+    log(value), clipped to +-5), for the binned-values comparator. Returns (model token ids, edges),
+    with n_bins - 1 edges per token; model ids are raw ids + 1, as in get_batch.
+    """
+    tokens, edges = [], []
+    q = np.arange(1, n_bins) / n_bins
+    for raw, (mean, std) in sorted(values_stats.items()):
+        if std <= 0:  # get_batch gives these no value
+            continue
+        rows = (data[:, 2] == raw) & (values > 0)
+        z = np.clip((np.log(values[rows].astype(np.float64)) - mean) / std, -5.0, 5.0)
+        tokens.append(int(raw) + 1)
+        edges.append([float(e) for e in np.quantile(z, q)])
+    return tokens, edges
+
+
 def shuffle_values_within_tokens(data, values, seed=0):
     """
     Control for FiLM: permute values among all rows of the same token, so each lab keeps its value

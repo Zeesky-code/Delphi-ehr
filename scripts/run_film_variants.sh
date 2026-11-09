@@ -50,6 +50,8 @@ ${ANCHOR}_numeric   $FILM --film_location=$ANCHOR --film_context=numeric
 ${ANCHOR}_layer0    $FILM --film_location=$ANCHOR --film_layers=0
 ${ANCHOR}_layers01  $FILM --film_location=$ANCHOR --film_layers=0,1
 ${ANCHOR}_h32       $FILM --film_location=$ANCHOR --film_hidden_dim=32
+binned          $BASELINE --value_bins=10
+binned_shuffled $BASELINE --value_bins=10 --film_shuffle_values=True
 attn_pre_shuffled       $FILM --film_location=attn_pre --film_shuffle_values=True
 qkv_shuffled            $FILM --film_location=qkv --film_shuffle_values=True
 ${ANCHOR}_numeric_shuffled  $FILM --film_location=$ANCHOR --film_context=numeric --film_shuffle_values=True
@@ -60,6 +62,11 @@ extra=()
 while [ $# -gt 0 ]; do
     if [ "$1" = "--" ]; then shift; extra=("$@"); break; fi
     selected+=("$1"); shift
+done
+
+known=$(awk 'NF {print $1}' <<< "$VARIANTS")
+for s in ${selected[@]+"${selected[@]}"}; do
+    grep -qx -- "$s" <<< "$known" || { echo "unknown variant: $s (with ANCHOR=$ANCHOR)" >&2; exit 1; }
 done
 
 is_selected() {

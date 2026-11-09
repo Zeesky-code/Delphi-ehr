@@ -1,5 +1,5 @@
 # MIMIC-IV data must not be shared (PhysioNet data use agreement): never commit derived data
-data/mimic4_labs/
+data/mimic4_labs*/
 mimic_scoping/
 
 # training outputs
@@ -18,3 +18,5 @@ ResearchActionPlan_Zainab.pdf
 ResearchActionPlan_Zainab_V2.pdf
 AbstractModel.zip
 Enhancing_Machine_Learning_Models_for_Medical_Coding_Diagnostic_Codes_Mapping_and_Synthetic_Clinical_Notes.pdf
+mimic4_labs_icd9.tgz
+JBiG_abstract_Lawal_review_APL.docx
