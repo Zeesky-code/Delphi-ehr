@@ -75,6 +75,7 @@ film_hidden_dim = 0
 film_scale = 0.1
 film_shuffle_values = False  # control: permute each lab's values across patients (see utils)
 value_bins = 0  # comparator to FiLM: > 0 adds a learned vector per (lab, quantile bin); see DelphiConfig
+film_value_bins = 0  # binned FiLM: > 0 feeds FiLM each value's quantile-bin centre instead of the value
 ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
@@ -108,7 +109,8 @@ val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint32, mode='r
 train_values_path = os.path.join(data_dir, 'train_values.bin')
 val_values_path = os.path.join(data_dir, 'val_values.bin')
 uses_values = use_film or value_bins > 0
-value_bin_tokens, value_bin_edges = [], []
+value_bin_tokens, value_bin_edges, value_bin_centres = [], [], []
+n_value_bins = value_bins or film_value_bins
 if uses_values and os.path.exists(train_values_path):
     train_values = np.memmap(train_values_path, dtype=np.float32, mode='r')
     val_values = np.memmap(val_values_path, dtype=np.float32, mode='r')
@@ -119,15 +121,17 @@ if uses_values and os.path.exists(train_values_path):
     # Per-token-type statistics for z-score normalization (saved in checkpoints for evaluation)
     values_stats = log_value_stats(train_data, train_values)
     print(f"Loaded numeric values for {len(values_stats)} token types")
-    if value_bins > 0:
-        value_bin_tokens, value_bin_edges = value_bin_edges_of(train_data, train_values, values_stats, value_bins)
-        print(f"value_bins: {value_bins} quantile bins for {len(value_bin_tokens)} token types")
+    if n_value_bins > 0:
+        value_bin_tokens, value_bin_edges, value_bin_centres = value_bin_edges_of(
+            train_data, train_values, values_stats, n_value_bins)
+        print(f"{'film_value_bins' if film_value_bins else 'value_bins'}: {n_value_bins} quantile bins "
+              f"for {len(value_bin_tokens)} token types")
 else:
     train_values = None
     val_values = None
     values_stats = None
-    if value_bins > 0:
-        raise FileNotFoundError(f"value_bins needs {train_values_path}")
+    if n_value_bins > 0:
+        raise FileNotFoundError(f"value_bins / film_value_bins need {train_values_path}")
     if use_film:
         print("WARNING: use_film=True but no values files found, FiLM will act as identity")
 
@@ -160,11 +164,12 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   mask_ties=mask_ties, use_film=use_film, film_location=film_location,
                   film_layers=film_layers, film_mode=film_mode, film_context=film_context,
                   film_hidden_dim=film_hidden_dim, film_scale=film_scale,
-                  value_bins=value_bins, value_bin_tokens=value_bin_tokens, value_bin_edges=value_bin_edges,
+                  value_bins=value_bins, film_value_bins=film_value_bins, value_bin_tokens=value_bin_tokens,
+                  value_bin_edges=value_bin_edges, value_bin_centres=value_bin_centres,
                   ignore_tokens=ignore_tokens)  # start with model_args from command line
 FILM_KEYS = ['use_film', 'film_location', 'film_layers', 'film_mode', 'film_context',
              'film_hidden_dim', 'film_scale']
-VALUE_BIN_KEYS = ['value_bins', 'value_bin_tokens', 'value_bin_edges']
+VALUE_BIN_KEYS = ['value_bins', 'film_value_bins', 'value_bin_tokens', 'value_bin_edges', 'value_bin_centres']
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -430,6 +435,7 @@ summary = {
     **{k: model_args[k] for k in FILM_KEYS},
     'film_shuffle_values': film_shuffle_values,
     'value_bins': model_args['value_bins'],
+    'film_value_bins': model_args['film_value_bins'],
 }
 with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
     json.dump(summary, f, indent=2)

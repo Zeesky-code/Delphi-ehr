@@ -52,6 +52,7 @@ ${ANCHOR}_layers01  $FILM --film_location=$ANCHOR --film_layers=0,1
 ${ANCHOR}_h32       $FILM --film_location=$ANCHOR --film_hidden_dim=32
 binned          $BASELINE --value_bins=10
 binned_shuffled $BASELINE --value_bins=10 --film_shuffle_values=True
+attn_pre_binned $FILM --film_location=attn_pre --film_value_bins=10
 attn_pre_shuffled       $FILM --film_location=attn_pre --film_shuffle_values=True
 qkv_shuffled            $FILM --film_location=qkv --film_shuffle_values=True
 ${ANCHOR}_numeric_shuffled  $FILM --film_location=$ANCHOR --film_context=numeric --film_shuffle_values=True

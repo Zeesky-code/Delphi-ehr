@@ -268,17 +268,30 @@ class DelphiConfig:
     # that carry values, value_bin_edges their bin edges in z-score units (value_bins - 1 each); train.py
     # fills both from the training split.
     value_bins: int = 0
+    # Binned FiLM (capacity-matched comparator): with film_value_bins > 0, FiLM receives each value's
+    # bin centre (the median z-score of its bin in the training split, value_bin_centres) instead of
+    # the value, so it has exactly FiLM's parameters but only the bin's information.
+    film_value_bins: int = 0
     value_bin_tokens: list = field(default_factory=list)
     value_bin_edges: list = field(default_factory=list)
+    value_bin_centres: list = field(default_factory=list)
     ignore_tokens: list = field(default_factory=lambda: [0])
 
     def __post_init__(self):
-        if self.value_bins:
-            if self.use_film:
-                raise ValueError("value_bins is a comparator to FiLM: use one or the other")
-            if self.value_bins < 2 or len(self.value_bin_tokens) != len(self.value_bin_edges) or \
-                    any(len(e) != self.value_bins - 1 for e in self.value_bin_edges):
-                raise ValueError("value_bins needs >= 2 bins and value_bins - 1 edges per value token")
+        if self.value_bins and self.use_film:
+            raise ValueError("value_bins is a comparator to FiLM: use one or the other")
+        if self.film_value_bins and not self.use_film:
+            raise ValueError("film_value_bins needs use_film=True")
+        if self.value_bins and self.film_value_bins:
+            raise ValueError("use value_bins or film_value_bins, not both")
+        n_bins = self.value_bins or self.film_value_bins
+        if n_bins:
+            if n_bins < 2 or len(self.value_bin_tokens) != len(self.value_bin_edges) or \
+                    any(len(e) != n_bins - 1 for e in self.value_bin_edges):
+                raise ValueError("binning needs >= 2 bins and n_bins - 1 edges per value token")
+            if self.film_value_bins and (len(self.value_bin_centres) != len(self.value_bin_tokens) or
+                                         any(len(c) != n_bins for c in self.value_bin_centres)):
+                raise ValueError("film_value_bins needs n_bins centres per value token")
         if not self.use_film:
             return
         for name, allowed in (('film_location', FILM_LOCATIONS), ('film_mode', FILM_MODES),
@@ -329,17 +342,23 @@ class Delphi(nn.Module):
         # Binned values (comparator): one vector per (value token, bin), zero at the start so the model
         # starts as the baseline. value_slot maps a model token id to its row block (-1: no value).
         self.value_bin_emb = None
-        if config.value_bins:
+        n_bins = config.value_bins or config.film_value_bins
+        if n_bins:
             n_tok = len(config.value_bin_tokens)
-            self.value_bin_emb = nn.Embedding(n_tok * config.value_bins, config.n_embd)
-            nn.init.zeros_(self.value_bin_emb.weight)
             slot = torch.full((config.vocab_size,), -1, dtype=torch.long)
             slot[torch.tensor(config.value_bin_tokens, dtype=torch.long)] = torch.arange(n_tok)
             self.register_buffer('value_slot', slot, persistent=False)
             self.register_buffer('value_bin_edges', torch.tensor(config.value_bin_edges, dtype=torch.float32)
-                                 .view(n_tok, config.value_bins - 1), persistent=False)
+                                 .view(n_tok, n_bins - 1), persistent=False)
+        if config.value_bins:
+            self.value_bin_emb = nn.Embedding(n_tok * config.value_bins, config.n_embd)
+            nn.init.zeros_(self.value_bin_emb.weight)
             print("binned values: %d tokens x %d bins, %.3fM parameters"
                   % (n_tok, config.value_bins, self.value_bin_emb.weight.numel() / 1e6))
+        if config.film_value_bins:
+            self.register_buffer('value_bin_centres', torch.tensor(config.value_bin_centres, dtype=torch.float32)
+                                 .view(n_tok, n_bins), persistent=False)
+            print("binned FiLM: FiLM sees the bin centre of each value (%d tokens x %d bins)" % (n_tok, n_bins))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -402,7 +421,9 @@ class Delphi(nn.Module):
         values, value_mask = None, None
         if numeric_values is not None and self.config.use_film:
             values = numeric_values
-            value_mask = numeric_values[..., 1] > 0  # channel 1 flags tokens that carry a value
+            if self.config.film_value_bins:
+                values = self.binned_values(idx, numeric_values)
+            value_mask = values[..., 1] > 0  # channel 1 flags tokens that carry a value
         for block in self.transformer.h:
             x, a = block(x, attn_mask, values, value_mask)
             if return_attention:
@@ -466,6 +487,14 @@ class Delphi(nn.Module):
         bins = self.value_bins_of(idx, numeric_values)
         rows = self.value_slot[idx].clamp(min=0) * self.config.value_bins + bins.clamp(min=0)
         return self.value_bin_emb(rows) * (bins >= 0).unsqueeze(-1).to(self.value_bin_emb.weight.dtype)
+
+    def binned_values(self, idx, numeric_values):
+        """numeric_values with each z-score replaced by its bin centre (binned FiLM); 0 and no flag elsewhere."""
+        bins = self.value_bins_of(idx, numeric_values)
+        has_bin = bins >= 0
+        centres = self.value_bin_centres[self.value_slot[idx].clamp(min=0), bins.clamp(min=0)]
+        z = torch.where(has_bin, centres, torch.zeros_like(centres))
+        return torch.stack([z, has_bin.to(numeric_values.dtype)], dim=-1)
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
